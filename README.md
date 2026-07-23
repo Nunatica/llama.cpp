@@ -1,3 +1,16 @@
+> ## Why this fork
+>
+> Stock llama.cpp does not (yet) support the Upstage **Solar-Open2-250B**
+> architecture. This fork adds a working `solar_open2` implementation so you
+> can run Solar-Open2 GGUFs natively - no out-of-tree patching required.
+>
+> **Prebuilt GGUF quants:** https://huggingface.co/vcruz305/Solar-Open2-250B-GGUF
+>
+> See [SOLAR_OPEN2_FORK.md](SOLAR_OPEN2_FORK.md) for architecture details,
+> validation (logit parity + perplexity), and run instructions.
+>
+> ---
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
