@@ -13,8 +13,8 @@
 //  - Slots live in per-(expert_size, type) pools whose slot stride equals the
 //    source tensor's nb[2] exactly, so the batched mmvq kernel can index the
 //    pool like a regular expert tensor (strides are in block units).
-//  - Eviction: plain LRU per pool. Capacity on this class of hardware exceeds
-//    the decode working set, so eviction policy is not the binding constraint.
+//  - Eviction: layer-aware SLRU per pool with TinyLFU admission.
+//    A per-layer floor limits scan thrashing while the remaining slots stay shared.
 //
 // Keys are FNV-1a hashes of the weight tensor's name (stable across contexts
 // and mmap remaps) mixed with the expert id.
@@ -26,12 +26,14 @@
 #include "ggml-backend-impl.h"
 #include "../ggml-backend-moe-cache.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <deque>
 #include <mutex>
 #include <thread>
@@ -41,6 +43,23 @@
 
 #define MOE_CACHE_MAX_DEV    8
 #define MOE_CACHE_MAX_POOLS  8
+#define MOE_CACHE_FREQ_DEPTH 4
+#define MOE_CACHE_FREQ_WIDTH 8192
+#define MOE_CACHE_VICTIM_SCAN 64
+
+static_assert((MOE_CACHE_FREQ_WIDTH & (MOE_CACHE_FREQ_WIDTH - 1)) == 0, "frequency width must be a power of two");
+
+enum moe_cache_segment {
+    MOE_CACHE_SEGMENT_PROBATION = 0,
+    MOE_CACHE_SEGMENT_PROTECTED = 1,
+    MOE_CACHE_SEGMENT_COUNT     = 2,
+};
+
+enum moe_cache_residency {
+    MOE_CACHE_RESIDENCY_NONE = 0,
+    MOE_CACHE_RESIDENCY_PAIR = 1,
+    MOE_CACHE_RESIDENCY_DOWN = 2,
+};
 
 // key-space tag for paired (gate, up) entries: keeps them disjoint from the
 // name-hash-keyed entries of unpaired pools that share the same shape
@@ -48,11 +67,21 @@
 #define MOE_CACHE_LOG(...)   fprintf(stderr, __VA_ARGS__)
 
 struct moe_cache_slot {
-    uint64_t key;
-    int      prev;
-    int      next;
-    bool     valid;     // contents complete, lookups may hit
-    bool     queued;    // insert copy queued or in flight
+    uint64_t key           = 0;
+    uint64_t frequency_key = 0;
+    uint64_t layer_key     = 0;
+    uint64_t pin_epoch     = 0;
+    const void * src       = nullptr;
+    const void * src_gate  = nullptr;
+    size_t   bytes         = 0;
+    int      blk           = -1;
+    int      eid           = -1;
+    int      prev          = -1;
+    int      next          = -1;
+    uint8_t  segment       = MOE_CACHE_SEGMENT_PROBATION;
+    uint8_t  residency     = MOE_CACHE_RESIDENCY_NONE;
+    bool     valid         = false; // contents complete, lookups may hit
+    bool     queued        = false; // insert copy queued or in flight
 };
 
 struct moe_cache_pool {
@@ -66,8 +95,12 @@ struct moe_cache_pool {
 
     std::vector<moe_cache_slot> slots;
     std::unordered_map<uint64_t, int> map;
-    int lru_head = -1;
-    int lru_tail = -1;
+    int lru_head[MOE_CACHE_SEGMENT_COUNT] = {-1, -1};
+    int lru_tail[MOE_CACHE_SEGMENT_COUNT] = {-1, -1};
+    int scan_cursor[MOE_CACHE_SEGMENT_COUNT] = {-1, -1};
+    int n_segment[MOE_CACHE_SEGMENT_COUNT] = {};
+    std::unordered_map<uint64_t, int> layer_count;
+    uint64_t plan_epoch = 0;
 };
 
 struct moe_cache_device {
@@ -119,8 +152,14 @@ struct moe_cache_device {
     // miss decomposition (counters only, no behavior change)
     long long pool_hits[MOE_CACHE_MAX_POOLS] = {}, pool_miss[MOE_CACHE_MAX_POOLS] = {};
     long long miss_compulsory = 0, miss_capacity = 0, miss_admission = 0;
-    long long skip_throttle = 0, skip_budget = 0, skip_qfull = 0, skip_lrubusy = 0;
+    long long skip_policy = 0, skip_budget = 0, skip_qfull = 0, skip_lrubusy = 0;
+    long long policy_quota_admits = 0, policy_promotions = 0, policy_demotions = 0;
+    long long layer_hits[1024] = {}, layer_miss[1024] = {};
     std::unordered_set<uint64_t> ever_seen, ever_inserted;
+    uint8_t  frequency[MOE_CACHE_FREQ_DEPTH][MOE_CACHE_FREQ_WIDTH] = {};
+    uint64_t frequency_doorkeeper[MOE_CACHE_FREQ_WIDTH / 64] = {};
+    size_t   frequency_samples = 0;
+    size_t   frequency_sample_limit = 0;
     // per-phase wall time (thread-0 serial cost), microseconds
     long long t_plan_us = 0, t_disp_us = 0, t_coll_us = 0, n_nodes = 0;
     long long redirect_claims = 0, redirect_misses_up = 0;
@@ -146,7 +185,6 @@ struct moe_cache_global {
                                  // grows lazily AFTER our init; stealing it
                                  // crashes the model mid-decode (measured)
     int    inserts_per_plan = 8; // max inserts enqueued per plan() call
-    int    throttle_mod     = 8; // at capacity admit 1-in-N misses (GGML_CUDA_MOE_CACHE_THROTTLE)
     int    queue_max        = 512;
     int    n_workers        = 4;
     size_t min_expert_bytes = 1u << 20; // skip models whose experts are too small
@@ -155,6 +193,7 @@ struct moe_cache_global {
     int    max_batch        = 1; // decode batches up to this size use the cache
                                  // (GGML_CUDA_MOE_CACHE_MAX_BATCH; >1 for spec-verify/parallel)
     int    stats_every      = 0; // log every N collect() calls (0 = off)
+    int    layer_quota_pct  = 25; // pool share reserved as equal per-layer floors (GGML_CUDA_MOE_CACHE_LAYER_QUOTA_PCT)
 
     moe_cache_device dev[MOE_CACHE_MAX_DEV];
 
@@ -175,11 +214,13 @@ struct moe_cache_global {
     std::condition_variable cv_idle;          // signaled when a worker finishes a job
     std::deque<moe_cache_job>     queue;
     const void *            inflight_src[16] = {};   // per-worker current source
+    const void *            inflight_src_gate[16] = {};
     size_t                  inflight_len[16] = {};
     bool                    workers_started = false;
 
     // current node context (begin..collect happen on one thread)
     uint64_t     cur_key_base = 0;
+    uint64_t     cur_frequency_base = 0;
     const void * cur_host_base = nullptr;
     size_t       cur_expert_size = 0;
     int64_t      cur_n_expert = 0;
@@ -311,21 +352,254 @@ static inline uint64_t moe_cache_key(uint64_t name_hash, int eid) {
     return name_hash ^ ((uint64_t)(uint32_t)eid * 0x9E3779B97F4A7C15ULL);
 }
 
-// ---- LRU helpers (caller holds g.mu) ---------------------------------------
+static inline uint64_t moe_cache_frequency_base(const void * model_anchor, int blk) {
+    return 0x4652455155454E43ULL ^ ((uint64_t)(uint32_t)blk << 32) ^ moe_cache_ptr_hash(model_anchor);
+}
+
+static inline uint64_t moe_cache_frequency_key(uint64_t frequency_base, int eid) {
+    return moe_cache_key(frequency_base, eid);
+}
+
+static inline uint32_t moe_cache_frequency_index(uint64_t key, int depth) {
+    key += 0x9E3779B97F4A7C15ULL * (uint64_t)(depth + 1);
+    key = (key ^ (key >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    key = (key ^ (key >> 27)) * 0x94D049BB133111EBULL;
+    key ^= key >> 31;
+    return (uint32_t)key & (MOE_CACHE_FREQ_WIDTH - 1);
+}
+
+static int moe_cache_frequency_estimate(const moe_cache_device & d, uint64_t key) {
+    uint8_t count = 0xff;
+    for (int i = 0; i < MOE_CACHE_FREQ_DEPTH; i++) {
+        const uint8_t value = d.frequency[i][moe_cache_frequency_index(key, i)];
+        if (value < count) count = value;
+    }
+    const uint32_t door = moe_cache_frequency_index(key, MOE_CACHE_FREQ_DEPTH);
+    return count + ((d.frequency_doorkeeper[door >> 6] >> (door & 63)) & 1);
+}
+
+static void moe_cache_frequency_age(moe_cache_device & d) {
+    for (int i = 0; i < MOE_CACHE_FREQ_DEPTH; i++) {
+        for (int j = 0; j < MOE_CACHE_FREQ_WIDTH; j++) {
+            d.frequency[i][j] >>= 1;
+        }
+    }
+    memset(d.frequency_doorkeeper, 0, sizeof(d.frequency_doorkeeper));
+    d.frequency_samples = 0;
+}
+
+static int moe_cache_frequency_record(moe_cache_device & d, uint64_t key) {
+    const size_t sample_limit = d.frequency_sample_limit > 0 ? d.frequency_sample_limit : 1024;
+    if (d.frequency_samples >= sample_limit) {
+        moe_cache_frequency_age(d);
+    }
+
+    uint8_t count = 0xff;
+    uint32_t index[MOE_CACHE_FREQ_DEPTH];
+    for (int i = 0; i < MOE_CACHE_FREQ_DEPTH; i++) {
+        index[i] = moe_cache_frequency_index(key, i);
+        const uint8_t value = d.frequency[i][index[i]];
+        if (value < count) count = value;
+    }
+
+    const uint32_t door = moe_cache_frequency_index(key, MOE_CACHE_FREQ_DEPTH);
+    const uint64_t bit = 1ull << (door & 63);
+    uint64_t & door_word = d.frequency_doorkeeper[door >> 6];
+    if (!(door_word & bit)) {
+        door_word |= bit;
+    } else {
+        if (count < 15) {
+            for (int i = 0; i < MOE_CACHE_FREQ_DEPTH; i++) {
+                uint8_t & value = d.frequency[i][index[i]];
+                if (value == count) value++;
+            }
+            count++;
+        }
+    }
+    d.frequency_samples++;
+    return count + 1;
+}
+
+// ---- SLRU helpers (caller holds g.mu) --------------------------------------
+
+static void moe_cache_layer_register(moe_cache_pool & p, uint64_t layer_key) {
+    p.layer_count.emplace(layer_key, 0);
+}
+
+static int moe_cache_layer_count(const moe_cache_pool & p, uint64_t layer_key) {
+    const auto it = p.layer_count.find(layer_key);
+    return it == p.layer_count.end() ? 0 : it->second;
+}
+
+static int moe_cache_layer_quota(const moe_cache_pool & p) {
+    if (g.layer_quota_pct <= 0 || p.layer_count.empty()) return 0;
+    const int reserved = (int)((int64_t)p.n_slots * g.layer_quota_pct / 100);
+    return reserved / (int)p.layer_count.size();
+}
 
 static void moe_cache_lru_remove(moe_cache_pool & p, int idx) {
     moe_cache_slot & s = p.slots[idx];
-    if (s.prev >= 0) p.slots[s.prev].next = s.next; else p.lru_head = s.next;
-    if (s.next >= 0) p.slots[s.next].prev = s.prev; else p.lru_tail = s.prev;
+    const int segment = s.segment;
+    if (s.prev >= 0) p.slots[s.prev].next = s.next; else p.lru_head[segment] = s.next;
+    if (s.next >= 0) p.slots[s.next].prev = s.prev; else p.lru_tail[segment] = s.prev;
     s.prev = s.next = -1;
+    p.n_segment[segment]--;
 }
 
-static void moe_cache_lru_push_back(moe_cache_pool & p, int idx) {
+static void moe_cache_lru_push_back(moe_cache_pool & p, int idx, int segment) {
     moe_cache_slot & s = p.slots[idx];
-    s.prev = p.lru_tail;
+    s.segment = (uint8_t)segment;
+    s.prev = p.lru_tail[segment];
     s.next = -1;
-    if (p.lru_tail >= 0) p.slots[p.lru_tail].next = idx; else p.lru_head = idx;
-    p.lru_tail = idx;
+    if (p.lru_tail[segment] >= 0) p.slots[p.lru_tail[segment]].next = idx; else p.lru_head[segment] = idx;
+    p.lru_tail[segment] = idx;
+    p.n_segment[segment]++;
+}
+
+static void moe_cache_lru_push_front(moe_cache_pool & p, int idx, int segment) {
+    moe_cache_slot & s = p.slots[idx];
+    s.segment = (uint8_t)segment;
+    s.prev = -1;
+    s.next = p.lru_head[segment];
+    if (p.lru_head[segment] >= 0) p.slots[p.lru_head[segment]].prev = idx; else p.lru_tail[segment] = idx;
+    p.lru_head[segment] = idx;
+    p.n_segment[segment]++;
+}
+
+static void moe_cache_slot_assign(moe_cache_pool & p, int idx, uint64_t key, uint64_t frequency_key, uint64_t layer_key,
+                                  const void * src, const void * src_gate, size_t bytes,
+                                  int blk, int eid, bool queued, int segment = MOE_CACHE_SEGMENT_PROBATION,
+                                  bool lru_front = false) {
+    moe_cache_slot & s = p.slots[idx];
+    s = moe_cache_slot{};
+    s.key = key;
+    s.frequency_key = frequency_key;
+    s.layer_key = layer_key;
+    s.src = src;
+    s.src_gate = src_gate;
+    s.bytes = bytes;
+    s.blk = blk;
+    s.eid = eid;
+    s.queued = queued;
+    moe_cache_layer_register(p, layer_key);
+    p.layer_count[layer_key]++;
+    if (lru_front) moe_cache_lru_push_front(p, idx, segment); else moe_cache_lru_push_back(p, idx, segment);
+}
+
+static void moe_cache_residency_clear(const moe_cache_slot & s) {
+    if (s.blk < 0 || s.blk >= 1024 || s.eid < 0 || s.eid >= 256) return;
+    uint64_t (* resident)[4] = s.residency == MOE_CACHE_RESIDENCY_PAIR ? g.resident_pair
+        : s.residency == MOE_CACHE_RESIDENCY_DOWN ? g.resident_down : nullptr;
+    if (resident) resident[s.blk][s.eid >> 6] &= ~(1ull << (s.eid & 63));
+}
+
+static void moe_cache_slot_clear(moe_cache_pool & p, int idx) {
+    moe_cache_slot & s = p.slots[idx];
+    moe_cache_lru_remove(p, idx);
+    moe_cache_residency_clear(s);
+    auto layer = p.layer_count.find(s.layer_key);
+    if (layer != p.layer_count.end() && layer->second > 0) layer->second--;
+    s = moe_cache_slot{};
+    moe_cache_lru_push_front(p, idx, MOE_CACHE_SEGMENT_PROBATION);
+}
+
+static void moe_cache_slot_release(moe_cache_pool & p, int idx) {
+    moe_cache_slot & s = p.slots[idx];
+    moe_cache_lru_remove(p, idx);
+    moe_cache_residency_clear(s);
+    auto layer = p.layer_count.find(s.layer_key);
+    if (layer != p.layer_count.end() && layer->second > 0) layer->second--;
+    s = moe_cache_slot{};
+}
+
+static void moe_cache_slru_rebalance(moe_cache_device & d, moe_cache_pool & p) {
+    int protected_target = 4 * p.n_slots / 5;
+    if (protected_target >= p.n_slots) protected_target = p.n_slots - 1;
+    while (p.n_segment[MOE_CACHE_SEGMENT_PROTECTED] > protected_target) {
+        const int demote = p.lru_head[MOE_CACHE_SEGMENT_PROTECTED];
+        if (demote < 0) break;
+        moe_cache_lru_remove(p, demote);
+        moe_cache_lru_push_back(p, demote, MOE_CACHE_SEGMENT_PROBATION);
+        d.policy_demotions++;
+    }
+}
+
+static void moe_cache_slru_touch(moe_cache_device & d, moe_cache_pool & p, int idx) {
+    moe_cache_slot & s = p.slots[idx];
+    if (s.segment == MOE_CACHE_SEGMENT_PROTECTED) {
+        moe_cache_lru_remove(p, idx);
+        moe_cache_lru_push_back(p, idx, MOE_CACHE_SEGMENT_PROTECTED);
+        moe_cache_slru_rebalance(d, p);
+        return;
+    }
+
+    moe_cache_lru_remove(p, idx);
+    moe_cache_lru_push_back(p, idx, MOE_CACHE_SEGMENT_PROTECTED);
+    d.policy_promotions++;
+    moe_cache_slru_rebalance(d, p);
+}
+
+static bool moe_cache_victim_eligible(const moe_cache_pool & p, int idx, uint64_t candidate_layer_key,
+                                      int quota, bool candidate_under_quota) {
+    const moe_cache_slot & s = p.slots[idx];
+    if (s.queued || s.pin_epoch == p.plan_epoch) return false;
+    if (!s.valid || quota == 0) return true;
+    if (candidate_under_quota) return moe_cache_layer_count(p, s.layer_key) > quota;
+    return s.layer_key == candidate_layer_key || moe_cache_layer_count(p, s.layer_key) > quota;
+}
+
+static int moe_cache_select_victim(moe_cache_pool & p, uint64_t candidate_layer_key) {
+    const int quota = moe_cache_layer_quota(p);
+    const bool candidate_under_quota = moe_cache_layer_count(p, candidate_layer_key) < quota;
+    // Bound policy cost per miss. Failed scans rotate through large segments.
+    for (int segment = MOE_CACHE_SEGMENT_PROBATION; segment < MOE_CACHE_SEGMENT_COUNT; segment++) {
+        int idx = p.scan_cursor[segment];
+        if (idx < 0 || idx >= p.n_used || p.slots[idx].segment != segment) idx = p.lru_head[segment];
+        const int budget = p.n_segment[segment] < MOE_CACHE_VICTIM_SCAN
+            ? p.n_segment[segment] : MOE_CACHE_VICTIM_SCAN;
+        for (int guard = 0; idx >= 0 && guard < budget; guard++) {
+            if (moe_cache_victim_eligible(p, idx, candidate_layer_key, quota, candidate_under_quota)) {
+                p.scan_cursor[segment] = -1;
+                return idx;
+            }
+            idx = p.slots[idx].next;
+            if (idx < 0) idx = p.lru_head[segment];
+        }
+        p.scan_cursor[segment] = idx;
+    }
+    return -1;
+}
+
+static int moe_cache_find_and_pin(moe_cache_device & d, moe_cache_pool & p, uint64_t key, bool & pending) {
+    pending = false;
+    const auto it = p.map.find(key);
+    if (it == p.map.end()) return -1;
+    if (!p.slots[it->second].valid) {
+        pending = true;
+        return -1;
+    }
+    const int idx = it->second;
+    moe_cache_slru_touch(d, p, idx);
+    p.slots[idx].pin_epoch = p.plan_epoch;
+    return idx;
+}
+
+enum moe_cache_admission {
+    MOE_CACHE_ADMISSION_REJECT,
+    MOE_CACHE_ADMISSION_FREQUENCY,
+    MOE_CACHE_ADMISSION_QUOTA,
+};
+
+static moe_cache_admission moe_cache_admit(const moe_cache_device & d, const moe_cache_pool & p,
+                                           int victim, uint64_t candidate_layer_key, int candidate_frequency) {
+    const moe_cache_slot & s = p.slots[victim];
+    if (!s.valid) return MOE_CACHE_ADMISSION_FREQUENCY;
+    const int quota = moe_cache_layer_quota(p);
+    if (moe_cache_layer_count(p, candidate_layer_key) < quota) {
+        return MOE_CACHE_ADMISSION_QUOTA;
+    }
+    return candidate_frequency > moe_cache_frequency_estimate(d, s.frequency_key)
+        ? MOE_CACHE_ADMISSION_FREQUENCY : MOE_CACHE_ADMISSION_REJECT;
 }
 
 // ---- insert workers ----------------------------------------------------------
@@ -352,8 +626,9 @@ restart:
             const int unit = g.backfill.eid++;
             const int eid  = unit >> 1;
             const bool want_pair = (unit & 1) == 0;
-            if (g.backfill.phase == 0 && eid < 256) {
+            if (g.backfill.phase == 0) {
                 // hot-prior pass: only entries that were resident last session
+                if (eid >= 256) continue;
                 const uint64_t * hb = want_pair ? g.hot_pair[blk] : g.hot_down[blk];
                 if (!((hb[eid >> 6] >> (eid & 63)) & 1)) continue;
             }
@@ -363,24 +638,35 @@ restart:
             moe_cache_pool & p = d.pools[pi];
             if (!p.slab || p.n_used >= p.n_slots) continue;
             if (want_pair && (!p.paired || !g.role_base[0][blk] || !g.role_base[1][blk])) continue;
-            if (!want_pair && !g.blk_down_base[blk]) continue;
+            if (!want_pair && (!g.blk_down_base[blk] || !g.role_base[0][blk])) continue;
 
             const uint64_t key = want_pair
                 ? moe_cache_key(MOE_CACHE_PAIR_KEY_TAG ^ ((uint64_t)blk << 32) ^ moe_cache_ptr_hash(g.role_base[0][blk]), eid)
                 : moe_cache_key(g.blk_down_kb[blk], eid);
             if (p.map.count(key)) continue;
 
+            const void * src = want_pair
+                ? (const char *)g.role_base[1][blk] + (size_t)eid * p.expert_size
+                : (const char *)g.blk_down_base[blk] + (size_t)eid * p.expert_size;
+            const void * src_gate = want_pair
+                ? (const char *)g.role_base[0][blk] + (size_t)eid * p.expert_size
+                : nullptr;
+            const void * frequency_anchor = g.role_base[0][blk];
+            const uint64_t layer_key = moe_cache_frequency_base(frequency_anchor, blk);
+            const uint64_t frequency_key = moe_cache_frequency_key(layer_key, eid);
+            const bool hot_prior = g.backfill.phase == 0;
             const int si = p.n_used++;
-            p.slots[si] = moe_cache_slot{key, -1, -1, false, true};
-            moe_cache_lru_push_back(p, si);
+            moe_cache_slot_assign(p, si, key, frequency_key, layer_key, src, src_gate, p.expert_size,
+                                  blk, eid, true, hot_prior ? MOE_CACHE_SEGMENT_PROTECTED : MOE_CACHE_SEGMENT_PROBATION,
+                                  !hot_prior);
+            p.slots[si].residency = want_pair ? MOE_CACHE_RESIDENCY_PAIR : MOE_CACHE_RESIDENCY_DOWN;
+            if (hot_prior) {
+                moe_cache_frequency_record(d, frequency_key);
+                moe_cache_slru_rebalance(d, p);
+            }
             p.map[key] = si;
             d.inserts++;
-            out = moe_cache_job{di, pi, key, si,
-                          want_pair ? (const char *)g.role_base[1][blk] + (size_t)eid * p.expert_size
-                                    : (const char *)g.blk_down_base[blk] + (size_t)eid * p.expert_size,
-                          want_pair ? (const char *)g.role_base[0][blk] + (size_t)eid * p.expert_size
-                                    : nullptr,
-                          p.expert_size, blk, eid};
+            out = moe_cache_job{di, pi, key, si, src, src_gate, p.expert_size, blk, eid};
             return true;
         }
     }
@@ -449,6 +735,7 @@ static void moe_cache_worker_main(int wid) {
             g.queue.pop_front();
         have_job:
             g.inflight_src[wid] = job.src;
+            g.inflight_src_gate[wid] = job.src_gate;
             g.inflight_len[wid] = job.bytes;
         }
 
@@ -493,20 +780,21 @@ static void moe_cache_worker_main(int wid) {
         {
             std::lock_guard<std::mutex> lk(g.mu);
             g.inflight_src[wid] = nullptr;
+            g.inflight_src_gate[wid] = nullptr;
             g.inflight_len[wid] = 0;
             g.cv_idle.notify_all();
             moe_cache_slot & s = p.slots[job.slot_idx];
             if (s.queued && s.key == job.key) {
-                if (job.blk >= 0 && job.blk < 1024 && job.eid >= 0 && job.eid < 256) {
-                    (job.src_gate ? g.resident_pair : g.resident_down)[job.blk][job.eid >> 6]
-                        |= 1ull << (job.eid & 63);
-                }
                 s.queued = false;
                 if (err == cudaSuccess) {
+                    if (job.blk >= 0 && job.blk < 1024 && job.eid >= 0 && job.eid < 256) {
+                        (job.src_gate ? g.resident_pair : g.resident_down)[job.blk][job.eid >> 6]
+                            |= 1ull << (job.eid & 63);
+                    }
                     s.valid = true;
                 } else {
                     p.map.erase(s.key);
-                    s.key = 0;
+                    moe_cache_slot_clear(p, job.slot_idx);
                 }
             }
             if (err != cudaSuccess) {
@@ -608,8 +896,16 @@ static bool moe_cache_pool_alloc(int di, size_t expert_size, int wtype, size_t b
     p.n_slots     = ns;
     p.n_used      = 0;
     p.map.clear();
-    p.lru_head = p.lru_tail = -1;
-    p.slots.assign(ns, moe_cache_slot{0, -1, -1, false, false});
+    for (int segment = 0; segment < MOE_CACHE_SEGMENT_COUNT; segment++) {
+        p.lru_head[segment] = -1;
+        p.lru_tail[segment] = -1;
+        p.scan_cursor[segment] = -1;
+        p.n_segment[segment] = 0;
+    }
+    p.layer_count.clear();
+    p.plan_epoch = 0;
+    p.slots.assign(ns, moe_cache_slot{});
+    d.frequency_sample_limit += (size_t)ns * 10;
     d.n_pools++;
     MOE_CACHE_LOG("[moe-cache] dev=%d pool[%d]: type=%d slot=%zu KB slots=%d total=%zu MB%s\n",
             di, d.n_pools - 1, wtype, expert_size >> 10, ns,
@@ -848,9 +1144,9 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
 
     if (blk >= 0 && blk < 1024) {
         g.blk_n_expert[blk] = (int)n_expert;
-        if (d.pools[pi].paired && (role == 0 || role == 1)) {
-            g.blk_pair_pool[blk] = (int8_t)pi;
+        if (role == 0 || role == 1) {
             g.role_base[role][blk] = host_base;   // backfill pair sources (also pre-PP-bail)
+            if (d.pools[pi].paired) g.blk_pair_pool[blk] = (int8_t)pi;
         } else if (role == 2) {
             g.blk_down_pool[blk] = (int8_t)pi;
             g.blk_down_kb[blk]   = kb ^ moe_cache_ptr_hash(host_base);
@@ -876,13 +1172,15 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
     // tensor's host base (two models in one process must never alias — names
     // and blk indices collide across models, data pointers do not)
     if (d.pools[pi].paired && (role == 0 || role == 1)) {
-        if (blk >= 0 && blk < 1024) g.role_base[role][blk] = host_base;
         const void * anchor = (blk >= 0 && blk < 1024 && g.role_base[0][blk])
                               ? g.role_base[0][blk] : host_base;
         g.cur_key_base = MOE_CACHE_PAIR_KEY_TAG ^ ((uint64_t)blk << 32) ^ moe_cache_ptr_hash(anchor);
     } else {
         g.cur_key_base = kb ^ moe_cache_ptr_hash(host_base);
     }
+    const void * frequency_anchor = role >= 0 && blk >= 0 && blk < 1024 && g.role_base[0][blk]
+        ? g.role_base[0][blk] : host_base;
+    g.cur_frequency_base = moe_cache_frequency_base(frequency_anchor, blk);
     g.cur_host_base   = host_base;
     g.cur_expert_size = expert_size;
     g.cur_n_expert    = n_expert;
@@ -923,35 +1221,38 @@ static int moe_cache_plan(int di, const int32_t * ids, int n_ids, int32_t * slot
     int inserts_left = g.inserts_per_plan;
 
     std::lock_guard<std::mutex> lk(g.mu);
+    moe_cache_layer_register(p, g.cur_frequency_base);
+    if (++p.plan_epoch == 0) p.plan_epoch++;
 
+    const bool count_layer_access = !(p.paired && g.cur_role == 1);
     for (int k = 0; k < n_ids; k++) {
         slot_idx[k] = -1;
         const int eid = ids[k];
         if (eid < 0 || eid >= g.cur_n_expert) continue;
         const uint64_t key = moe_cache_key(g.cur_key_base, eid);
+        const uint64_t frequency_key = moe_cache_frequency_key(g.cur_frequency_base, eid);
+        // A paired up entry already received the gate sample.
+        if (!(p.paired && g.cur_role == 1)) moe_cache_frequency_record(d, frequency_key);
 
-        auto it = p.map.find(key);
-        if (it != p.map.end()) {
-            const int si = it->second;
-            moe_cache_slot & s = p.slots[si];
-            if (s.valid) {
-                moe_cache_lru_remove(p, si);
-                moe_cache_lru_push_back(p, si);
-                slot_idx[k] = si;
-                d.hits++;
-                d.pool_hits[g.cur_pool]++;
-                n_hits++;
-            } else {
-                // insert still queued/in-flight: CPU computes the row this time
-                d.queued_misses++;
-                d.misses++;
-                d.pool_miss[g.cur_pool]++;
-            }
+        bool pending = false;
+        const int si = moe_cache_find_and_pin(d, p, key, pending);
+        if (si >= 0) {
+            slot_idx[k] = si;
+            d.hits++;
+            d.pool_hits[g.cur_pool]++;
+            if (count_layer_access && g.cur_blk >= 0 && g.cur_blk < 1024) d.layer_hits[g.cur_blk]++;
+            n_hits++;
             continue;
         }
 
         d.misses++;
         d.pool_miss[g.cur_pool]++;
+        if (count_layer_access && g.cur_blk >= 0 && g.cur_blk < 1024) d.layer_miss[g.cur_blk]++;
+        if (pending) {
+            // The CPU computes rows whose insert copy has not completed.
+            d.queued_misses++;
+            continue;
+        }
         if (d.ever_seen.insert(key).second) {
             d.miss_compulsory++;
         } else if (d.ever_inserted.count(key)) {
@@ -959,6 +1260,17 @@ static int moe_cache_plan(int di, const int32_t * ids, int n_ids, int32_t * slot
         } else {
             d.miss_admission++;  // seen before but never admitted
         }
+    }
+
+    // All resident rows are pinned before a miss can choose a victim.
+    for (int k = 0; k < n_ids; k++) {
+        if (slot_idx[k] >= 0) continue;
+        const int eid = ids[k];
+        if (eid < 0 || eid >= g.cur_n_expert) continue;
+        const uint64_t key = moe_cache_key(g.cur_key_base, eid);
+        if (p.map.count(key)) continue;
+        const uint64_t frequency_key = moe_cache_frequency_key(g.cur_frequency_base, eid);
+        const int candidate_frequency = moe_cache_frequency_estimate(d, frequency_key);
 
         // ---- enqueue async insert (budgeted) ----
         if (inserts_left <= 0) {
@@ -971,15 +1283,6 @@ static int moe_cache_plan(int di, const int32_t * ids, int n_ids, int32_t * slot
             d.skip_qfull++;
             continue;
         }
-        // admission throttle at capacity: when the pool is full, churn (evict +
-        // re-copy on every miss) steals host RAM bandwidth from the CPU matmuls.
-        // Admit only a fraction of misses so the content still adapts but the
-        // copy traffic stays bounded.
-        if (p.n_used >= p.n_slots && (d.misses % g.throttle_mod) != 0) {
-            d.insert_skips++;
-            d.skip_throttle++;
-            continue;
-        }
         // paired-entry inserts (gate/up roles only — pools can be SHARED with
         // other roles whose tensors merely have the same shape; those use the
         // plain name-keyed path below and never collide in key space)
@@ -990,38 +1293,38 @@ static int moe_cache_plan(int di, const int32_t * ids, int n_ids, int32_t * slot
             continue;
         }
 
+        const void * src_up = pair_entry
+            ? (const char *)g.role_base[1][g.cur_blk] + (size_t)eid * g.cur_expert_size
+            : (const char *)g.cur_host_base + (size_t)eid * g.cur_expert_size;
+        const void * src_gate = pair_entry
+            ? (const char *)g.role_base[0][g.cur_blk] + (size_t)eid * g.cur_expert_size
+            : nullptr;
+
         int si = -1;
         if (p.n_used < p.n_slots) {
             si = p.n_used++;
         } else {
-            int cand = p.lru_head;
-            int guard = 0;
-            while (cand >= 0 && p.slots[cand].queued && guard++ < 64) cand = p.slots[cand].next;
-            if (cand < 0 || p.slots[cand].queued) { d.insert_skips++; d.skip_lrubusy++; continue; }
-            si = cand;
+            si = moe_cache_select_victim(p, g.cur_frequency_base);
+            if (si < 0) { d.insert_skips++; d.skip_lrubusy++; continue; }
+            const moe_cache_admission admission = moe_cache_admit(d, p, si, g.cur_frequency_base, candidate_frequency);
+            if (admission == MOE_CACHE_ADMISSION_REJECT) {
+                d.insert_skips++;
+                d.skip_policy++;
+                continue;
+            }
+            if (admission == MOE_CACHE_ADMISSION_QUOTA) d.policy_quota_admits++;
             moe_cache_slot & old = p.slots[si];
             if (old.valid || old.queued) {
                 p.map.erase(old.key);
                 d.evictions++;
-                // residency bitmap (hot-set persistence): this expert is leaving.
-                // The key does not encode (blk,eid) reversibly, so clear lazily:
-                // a stale bit merely makes the next session's warm backfill load
-                // one expert that is no longer hot (harmless).
             }
-            moe_cache_lru_remove(p, si);
+            moe_cache_slot_release(p, si);
         }
 
-        const void * src_up   = nullptr;
-        const void * src_gate = nullptr;
-        if (pair_entry) {
-            src_up   = (const char *)g.role_base[1][g.cur_blk] + (size_t)eid * g.cur_expert_size;
-            src_gate = (const char *)g.role_base[0][g.cur_blk] + (size_t)eid * g.cur_expert_size;
-        } else {
-            src_up = (const char *)g.cur_host_base + (size_t)eid * g.cur_expert_size;
-        }
-
-        p.slots[si] = moe_cache_slot{key, -1, -1, false, true};
-        moe_cache_lru_push_back(p, si);
+        moe_cache_slot_assign(p, si, key, frequency_key, g.cur_frequency_base, src_up, src_gate, g.cur_expert_size,
+                              g.cur_blk, eid, true);
+        p.slots[si].residency = pair_entry ? MOE_CACHE_RESIDENCY_PAIR
+            : g.cur_role == 2 ? MOE_CACHE_RESIDENCY_DOWN : MOE_CACHE_RESIDENCY_NONE;
         p.map[key] = si;
         d.inserts++;
         d.ever_inserted.insert(key);
@@ -1480,10 +1783,13 @@ extern "C" size_t ggml_moe_cache_trim(int device) {
         moe_cache_pool & p = d.pools[i];
         if (p.slab)  { freed += (size_t)p.n_slots * p.expert_size; cudaFree(p.slab);  p.slab  = nullptr; }
         if (p.slab2) { freed += (size_t)p.n_slots * p.expert_size; cudaFree(p.slab2); p.slab2 = nullptr; }
-        p.map.clear();
-        p.n_slots = 0;
-        p.n_used  = 0;
+        p = moe_cache_pool{};
     }
+    d.n_pools = 0;
+    memset(d.frequency, 0, sizeof(d.frequency));
+    memset(d.frequency_doorkeeper, 0, sizeof(d.frequency_doorkeeper));
+    d.frequency_samples = 0;
+    d.frequency_sample_limit = 0;
     if (d.d_ids)    { cudaFree(d.d_ids);          d.d_ids = nullptr;    d.ids_cap = 0; }
     if (d.d_act)    { cudaFree(d.d_act);          d.d_act = nullptr;    d.act_cap = 0; }
     if (d.d_act_q8) { cudaFree(d.d_act_q8);       d.d_act_q8 = nullptr; d.act_q8_cap = 0; }
@@ -1504,22 +1810,42 @@ extern "C" size_t ggml_moe_cache_trim(int device) {
 // Called when a host buffer is freed (model unload). Queued insert jobs whose
 // source lies in the range are dropped; a worker mid-copy from the range is
 // waited out; per-blk tensor-base learning that points into the range is reset.
-// Cached slots become unreachable automatically (keys mix the host base) and
-// are reclaimed by LRU.
+// Cached slots backed by the range are made immediately reusable.
+
+static bool moe_cache_source_overlaps(const void * src, size_t src_size, const void * base, size_t size) {
+    if (!src || !base || src_size == 0 || size == 0) return false;
+    const uintptr_t src_lo = (uintptr_t)src;
+    const uintptr_t base_lo = (uintptr_t)base;
+    const uintptr_t src_hi = src_size > UINTPTR_MAX - src_lo ? UINTPTR_MAX : src_lo + src_size;
+    const uintptr_t base_hi = size > UINTPTR_MAX - base_lo ? UINTPTR_MAX : base_lo + size;
+    return src_lo < base_hi && src_hi > base_lo;
+}
+
+static bool moe_cache_pool_invalidate_range(moe_cache_pool & p, const void * base, size_t size) {
+    bool invalidated = false;
+    for (int si = 0; si < p.n_used; si++) {
+        moe_cache_slot & s = p.slots[si];
+        if (!moe_cache_source_overlaps(s.src, s.bytes, base, size) &&
+            !moe_cache_source_overlaps(s.src_gate, s.bytes, base, size)) continue;
+        p.map.erase(s.key);
+        moe_cache_slot_clear(p, si);
+        invalidated = true;
+    }
+    return invalidated;
+}
 
 static void moe_cache_invalidate(const void * base, size_t size) {
     if (!g.enabled) return;
-    const char * lo = (const char *)base;
-    const char * hi = lo + size;
     auto in_range = [&](const void * p) {
-        return p && (const char *)p >= lo && (const char *)p < hi;
+        return moe_cache_source_overlaps(p, 1, base, size);
     };
 
     std::unique_lock<std::mutex> lk(g.mu);
+    bool reset_frequency = false;
     for (auto it = g.queue.begin(); it != g.queue.end(); ) {
-        if (in_range(it->src) || in_range(it->src_gate)) {
-            // orphan the slot bookkeeping (entry stays queued=true and is
-            // skipped by eviction until overwritten; safe and rare)
+        if (moe_cache_source_overlaps(it->src, it->bytes, base, size) ||
+            moe_cache_source_overlaps(it->src_gate, it->bytes, base, size)) {
+            reset_frequency = true;
             it = g.queue.erase(it);
         } else {
             ++it;
@@ -1528,13 +1854,57 @@ static void moe_cache_invalidate(const void * base, size_t size) {
     g.cv_idle.wait(lk, [&]{
         for (int w = 0; w < 16; w++) {
             const char * s = (const char *)g.inflight_src[w];
-            if (s && s + g.inflight_len[w] > lo && s < hi) return false;
+            const char * s_gate = (const char *)g.inflight_src_gate[w];
+            if (moe_cache_source_overlaps(s, g.inflight_len[w], base, size) ||
+                moe_cache_source_overlaps(s_gate, g.inflight_len[w], base, size)) return false;
         }
         return true;
     });
     for (int b = 0; b < 1024; b++) {
-        if (in_range(g.role_base[0][b])) g.role_base[0][b] = nullptr;
-        if (in_range(g.role_base[1][b])) g.role_base[1][b] = nullptr;
+        if (in_range(g.role_base[0][b])) { g.role_base[0][b] = nullptr; reset_frequency = true; }
+        if (in_range(g.role_base[1][b])) { g.role_base[1][b] = nullptr; reset_frequency = true; }
+        if (in_range(g.blk_down_base[b])) {
+            g.blk_down_base[b] = nullptr;
+            g.blk_down_kb[b] = 0;
+            reset_frequency = true;
+        }
+    }
+    for (int di = 0; di < g.n_dev; di++) {
+        moe_cache_device & d = g.dev[di];
+        for (int pi = 0; pi < d.n_pools; pi++) {
+            moe_cache_pool & p = d.pools[pi];
+            reset_frequency |= moe_cache_pool_invalidate_range(p, base, size);
+        }
+    }
+    if (reset_frequency) {
+        for (int di = 0; di < g.n_dev; di++) {
+            moe_cache_device & d = g.dev[di];
+            for (int pi = 0; pi < d.n_pools; pi++) {
+                moe_cache_pool & p = d.pools[pi];
+                p.layer_count.clear();
+                for (int si = 0; si < p.n_used; si++) {
+                    const moe_cache_slot & s = p.slots[si];
+                    if ((!s.valid && !s.queued) || s.blk < 0 || s.blk >= 1024) continue;
+                    moe_cache_layer_register(p, s.layer_key);
+                    p.layer_count[s.layer_key]++;
+                }
+                for (int blk = di; blk < 1024; blk += g.n_dev) {
+                    if ((g.blk_pair_pool[blk] == pi && (g.role_base[0][blk] || g.role_base[1][blk])) ||
+                        (g.blk_down_pool[blk] == pi && g.blk_down_base[blk])) {
+                        const void * anchor = g.role_base[0][blk] ? g.role_base[0][blk]
+                            : g.role_base[1][blk] ? g.role_base[1][blk] : g.blk_down_base[blk];
+                        moe_cache_layer_register(p, moe_cache_frequency_base(anchor, blk));
+                    }
+                }
+            }
+            memset(d.frequency, 0, sizeof(d.frequency));
+            memset(d.frequency_doorkeeper, 0, sizeof(d.frequency_doorkeeper));
+            memset(d.layer_hits, 0, sizeof(d.layer_hits));
+            memset(d.layer_miss, 0, sizeof(d.layer_miss));
+            d.frequency_samples = 0;
+        }
+        memset(g.resident_pair, 0, sizeof(g.resident_pair));
+        memset(g.resident_down, 0, sizeof(g.resident_down));
     }
 }
 
@@ -1578,25 +1948,55 @@ static void moe_cache_node_time(int code, int64_t us) {
 // ---- API: stats ----------------------------------------------------------------------
 
 static void moe_cache_stats(void) {
+    std::lock_guard<std::mutex> lk(g.mu);
     for (int i = 0; i < g.n_dev; i++) {
         moe_cache_device & d = g.dev[i];
-        if (!d.compute_stream) continue;
+        if (!d.compute_stream || d.dead) continue;
         const long long tot = d.hits + d.misses;
         int used = 0, slots = 0;
-        for (int pi = 0; pi < d.n_pools; pi++) { used += d.pools[pi].n_used; slots += d.pools[pi].n_slots; }
+        for (int pi = 0; pi < d.n_pools; pi++) {
+            const moe_cache_pool & p = d.pools[pi];
+            for (int si = 0; si < p.n_used; si++) used += p.slots[si].valid || p.slots[si].queued;
+            slots += p.n_slots;
+        }
         MOE_CACHE_LOG("[moe-cache] dev=%d hits=%lld/%lld (%.1f%%) inserts=%lld evict=%lld skip=%lld queued-miss=%lld used=%d/%d q=%zu\n",
                 i, d.hits, tot, tot ? 100.0 * d.hits / tot : 0.0,
                 d.inserts, d.evictions, d.insert_skips, d.queued_misses,
                 used, slots, g.queue.size());
-        MOE_CACHE_LOG("[moe-cache] dev=%d decomp: compulsory=%lld capacity=%lld admission=%lld inflight=%lld uniq-seen=%zu uniq-inserted=%zu | skips: throttle=%lld budget=%lld qfull=%lld lru=%lld\n",
+        MOE_CACHE_LOG("[moe-cache] dev=%d decomp: compulsory=%lld capacity=%lld admission=%lld inflight=%lld uniq-seen=%zu uniq-inserted=%zu | skips: policy=%lld budget=%lld qfull=%lld busy=%lld\n",
                 i, d.miss_compulsory, d.miss_capacity, d.miss_admission, d.queued_misses,
                 d.ever_seen.size(), d.ever_inserted.size(),
-                d.skip_throttle, d.skip_budget, d.skip_qfull, d.skip_lrubusy);
+                d.skip_policy, d.skip_budget, d.skip_qfull, d.skip_lrubusy);
+        MOE_CACHE_LOG("[moe-cache] dev=%d policy: quota-admit=%lld promote=%lld demote=%lld samples=%zu/%zu\n",
+                i, d.policy_quota_admits, d.policy_promotions, d.policy_demotions,
+                d.frequency_samples, d.frequency_sample_limit);
         for (int pi = 0; pi < d.n_pools; pi++) {
             const long long ptot = d.pool_hits[pi] + d.pool_miss[pi];
-            MOE_CACHE_LOG("[moe-cache] dev=%d pool[%d]: hits=%lld/%lld (%.1f%%) slots=%d slot=%zuKB\n",
+            const moe_cache_pool & p = d.pools[pi];
+            int active = 0, probation = 0, protected_count = 0;
+            for (int si = 0; si < p.n_used; si++) {
+                const moe_cache_slot & s = p.slots[si];
+                if (!s.valid && !s.queued) continue;
+                active++;
+                if (s.segment == MOE_CACHE_SEGMENT_PROTECTED) protected_count++; else probation++;
+            }
+            MOE_CACHE_LOG("[moe-cache] dev=%d pool[%d]: hits=%lld/%lld (%.1f%%) resident=%d/%d probation=%d protected=%d layers=%d quota=%d slot=%zuKB\n",
                     i, pi, d.pool_hits[pi], ptot, ptot ? 100.0 * d.pool_hits[pi] / ptot : 0.0,
-                    d.pools[pi].n_slots, d.pools[pi].expert_size >> 10);
+                    active, p.n_slots, probation, protected_count, (int)p.layer_count.size(),
+                    moe_cache_layer_quota(p), p.expert_size >> 10);
+        }
+        int layer_min = -1, layer_max = -1;
+        double hit_min = 0.0, hit_max = 0.0;
+        for (int blk = 0; blk < 1024; blk++) {
+            const long long layer_total = d.layer_hits[blk] + d.layer_miss[blk];
+            if (layer_total == 0) continue;
+            const double rate = 100.0 * d.layer_hits[blk] / layer_total;
+            if (layer_min < 0 || rate < hit_min) { layer_min = blk; hit_min = rate; }
+            if (layer_max < 0 || rate > hit_max) { layer_max = blk; hit_max = rate; }
+        }
+        if (layer_min >= 0) {
+            MOE_CACHE_LOG("[moe-cache] dev=%d layer-bundle-hit: min=blk.%d %.1f%% max=blk.%d %.1f%%\n",
+                    i, layer_min, hit_min, layer_max, hit_max);
         }
         if (d.n_nodes > 0) {
             MOE_CACHE_LOG("[moe-cache] dev=%d timing: nodes=%lld plan=%.1fus disp=%.1fus coll=%.1fus per-node total=%.1fus\n",
@@ -1616,10 +2016,213 @@ static void moe_cache_stats(void) {
 
 // ---- self-test ---------------------------------------------------------------------------
 //
-// GGML_CUDA_MOE_CACHE_SELFTEST=1 runs at registration: builds a synthetic quantized pool,
-// runs the full plan-free dispatch+collect path, and compares against a host
-// reference matvec on dequantized weights. No model required — this validates
-// the batched mmvq stride mapping and the staging logic in seconds.
+// GGML_CUDA_MOE_CACHE_SELFTEST=1 runs at registration and builds a synthetic quantized pool.
+// It runs the full plan-free dispatch+collect path and compares against a host reference matvec on dequantized weights.
+// No model is required. The host-only policy checks run even when no CUDA or HIP device is available.
+
+static bool moe_cache_policy_lists_ok(const moe_cache_pool & p) {
+    std::vector<uint8_t> seen(p.n_used, 0);
+    int total = 0;
+    for (int segment = 0; segment < MOE_CACHE_SEGMENT_COUNT; segment++) {
+        int prev = -1;
+        int count = 0;
+        int idx = p.lru_head[segment];
+        while (idx >= 0 && count <= p.n_used) {
+            if (idx >= p.n_used || seen[idx] || p.slots[idx].segment != segment || p.slots[idx].prev != prev) return false;
+            seen[idx] = 1;
+            prev = idx;
+            idx = p.slots[idx].next;
+            count++;
+        }
+        if (idx >= 0 || prev != p.lru_tail[segment] || count != p.n_segment[segment]) return false;
+        total += count;
+    }
+    return total == p.n_used;
+}
+
+static int moe_cache_policy_add(moe_cache_pool & p, uint64_t key, uint64_t frequency_key, uint64_t layer_key,
+                                int blk, int eid, int segment = MOE_CACHE_SEGMENT_PROBATION,
+                                bool lru_front = false) {
+    const int idx = p.n_used++;
+    moe_cache_slot_assign(p, idx, key, frequency_key, layer_key, nullptr, nullptr, 0,
+                          blk, eid, false, segment, lru_front);
+    p.slots[idx].valid = true;
+    p.map[key] = idx;
+    return idx;
+}
+
+static bool moe_cache_policy_selftest(void) {
+    const int quota_pct = g.layer_quota_pct;
+    g.layer_quota_pct = 25;
+
+    bool ok = true;
+    moe_cache_device d;
+    d.frequency_sample_limit = 100000;
+    int anchor_a = 0;
+    int anchor_b = 0;
+    const uint64_t layer0 = moe_cache_frequency_base(&anchor_a, 0);
+    const uint64_t layer1 = moe_cache_frequency_base(&anchor_a, 1);
+    const uint64_t layer2 = moe_cache_frequency_base(&anchor_a, 2);
+
+    moe_cache_pool p;
+    p.n_slots = 12;
+    p.slots.assign(p.n_slots, moe_cache_slot{});
+    moe_cache_layer_register(p, layer0);
+    moe_cache_layer_register(p, layer1);
+    moe_cache_layer_register(p, layer2);
+    for (int i = 0; i < p.n_slots; i++) {
+        const int blk = i == 0 ? 0 : 1;
+        const uint64_t layer_key = blk == 0 ? layer0 : layer1;
+        const uint64_t frequency_key = moe_cache_frequency_key(layer_key, i);
+        moe_cache_policy_add(p, 100 + i, frequency_key, layer_key, blk, i);
+    }
+    p.plan_epoch = 1;
+    ok &= moe_cache_layer_quota(p) == 1;
+
+    const uint64_t quota_key = moe_cache_frequency_key(layer2, 0);
+    int quota_frequency = moe_cache_frequency_record(d, quota_key);
+    int victim = moe_cache_select_victim(p, layer2);
+    ok &= victim >= 0 && p.slots[victim].blk == 1;
+    if (victim >= 0) {
+        for (int i = 0; i < 8; i++) moe_cache_frequency_record(d, p.slots[victim].frequency_key);
+        ok &= moe_cache_admit(d, p, victim, layer2, quota_frequency) == MOE_CACHE_ADMISSION_QUOTA;
+        const uint64_t old_key = p.slots[victim].key;
+        p.map.erase(old_key);
+        moe_cache_slot_release(p, victim);
+        moe_cache_slot_assign(p, victim, 999, quota_key, layer2, nullptr, nullptr, 0, 2, 0, false);
+        p.slots[victim].valid = true;
+        p.map[999] = victim;
+        ok &= !p.map.count(old_key) && p.map[999] == victim;
+        ok &= moe_cache_layer_count(p, layer1) == 10 && moe_cache_layer_count(p, layer2) == 1;
+    }
+
+    for (int i = 0; i < 10; i++) moe_cache_slru_touch(d, p, i);
+    ok &= p.n_segment[MOE_CACHE_SEGMENT_PROTECTED] == 9;
+    ok &= p.n_segment[MOE_CACHE_SEGMENT_PROBATION] == 3;
+    ok &= moe_cache_policy_lists_ok(p);
+
+    moe_cache_pool quota_boundary;
+    quota_boundary.n_slots = 64;
+    for (int blk = 0; blk < 60; blk++) {
+        moe_cache_layer_register(quota_boundary, moe_cache_frequency_base(&anchor_a, blk));
+    }
+    ok &= moe_cache_layer_quota(quota_boundary) == 0;
+    quota_boundary.n_slots = 256;
+    ok &= moe_cache_layer_quota(quota_boundary) == 1;
+    ok &= moe_cache_layer_quota(quota_boundary) * (int)quota_boundary.layer_count.size()
+        <= quota_boundary.n_slots * g.layer_quota_pct / 100;
+
+    moe_cache_pool p2;
+    p2.n_slots = 2;
+    p2.slots.assign(p2.n_slots, moe_cache_slot{});
+    const uint64_t layer3 = moe_cache_frequency_base(&anchor_a, 3);
+    moe_cache_layer_register(p2, layer3);
+    for (int i = 0; i < p2.n_slots; i++) {
+        const uint64_t frequency_key = moe_cache_frequency_key(layer3, i);
+        moe_cache_policy_add(p2, 200 + i, frequency_key, layer3, 3, i);
+    }
+    p2.plan_epoch = 1;
+    const uint64_t hot_key = p2.slots[0].frequency_key;
+    const uint64_t cold_key = moe_cache_frequency_key(layer3, 9);
+    for (int i = 0; i < 8; i++) moe_cache_frequency_record(d, hot_key);
+    int cold_frequency = moe_cache_frequency_record(d, cold_key);
+    ok &= moe_cache_admit(d, p2, 0, layer3, cold_frequency) == MOE_CACHE_ADMISSION_REJECT;
+    for (int i = 0; i < 5; i++) moe_cache_frequency_age(d);
+    moe_cache_frequency_record(d, cold_key);
+    cold_frequency = moe_cache_frequency_record(d, cold_key);
+    ok &= moe_cache_admit(d, p2, 0, layer3, cold_frequency) == MOE_CACHE_ADMISSION_FREQUENCY;
+    const uint64_t layer3_b = moe_cache_frequency_base(&anchor_b, 3);
+    ok &= layer3 != layer3_b && cold_key != moe_cache_frequency_key(layer3_b, 9);
+
+    moe_cache_pool model_scope;
+    model_scope.n_slots = 8;
+    model_scope.slots.assign(model_scope.n_slots, moe_cache_slot{});
+    moe_cache_layer_register(model_scope, layer3);
+    moe_cache_layer_register(model_scope, layer3_b);
+    for (int i = 0; i < model_scope.n_slots; i++) {
+        const uint64_t layer_key = i == 0 ? layer3 : layer3_b;
+        moe_cache_policy_add(model_scope, 600 + i, moe_cache_frequency_key(layer_key, i), layer_key, 3, i);
+    }
+    model_scope.plan_epoch = 1;
+    ok &= moe_cache_layer_quota(model_scope) == 1;
+    ok &= moe_cache_select_victim(model_scope, layer3_b) == 1;
+
+    bool pending = false;
+    ok &= moe_cache_find_and_pin(d, p2, p2.slots[0].key, pending) == 0 && !pending;
+    ok &= moe_cache_select_victim(p2, layer3) == 1;
+    p2.slots[1].queued = true;
+    ok &= moe_cache_select_victim(p2, layer3) < 0;
+    ok &= moe_cache_policy_lists_ok(p2);
+
+    moe_cache_pool p3;
+    p3.n_slots = MOE_CACHE_VICTIM_SCAN + 2;
+    p3.slots.assign(p3.n_slots, moe_cache_slot{});
+    const uint64_t layer4 = moe_cache_frequency_base(&anchor_a, 4);
+    moe_cache_layer_register(p3, layer4);
+    for (int i = 0; i < p3.n_slots; i++) {
+        const uint64_t frequency_key = moe_cache_frequency_key(layer4, i);
+        moe_cache_policy_add(p3, 300 + i, frequency_key, layer4, 4, i);
+        if (i < MOE_CACHE_VICTIM_SCAN) p3.slots[i].pin_epoch = 1;
+    }
+    p3.plan_epoch = 1;
+    ok &= moe_cache_select_victim(p3, layer4) < 0;
+    ok &= moe_cache_select_victim(p3, layer4) == MOE_CACHE_VICTIM_SCAN;
+    p3.slots[MOE_CACHE_VICTIM_SCAN].pin_epoch = p3.plan_epoch;
+    moe_cache_lru_remove(p3, MOE_CACHE_VICTIM_SCAN + 1);
+    moe_cache_lru_push_back(p3, MOE_CACHE_VICTIM_SCAN + 1, MOE_CACHE_SEGMENT_PROTECTED);
+    ok &= moe_cache_select_victim(p3, layer4) == MOE_CACHE_VICTIM_SCAN + 1;
+
+    moe_cache_pool p4;
+    p4.n_slots = 10;
+    p4.slots.assign(p4.n_slots, moe_cache_slot{});
+    const uint64_t layer5 = moe_cache_frequency_base(&anchor_a, 5);
+    for (int i = 0; i < 9; i++) {
+        const uint64_t frequency_key = moe_cache_frequency_key(layer5, i);
+        moe_cache_policy_add(p4, 400 + i, frequency_key, layer5, 5, i, MOE_CACHE_SEGMENT_PROTECTED);
+        moe_cache_slru_rebalance(d, p4);
+    }
+    const uint64_t cold_backfill_key = moe_cache_frequency_key(layer5, 9);
+    const int cold_backfill = moe_cache_policy_add(
+        p4, 409, cold_backfill_key, layer5, 5, 9, MOE_CACHE_SEGMENT_PROBATION, true);
+    ok &= p4.n_segment[MOE_CACHE_SEGMENT_PROTECTED] == 8;
+    ok &= p4.lru_head[MOE_CACHE_SEGMENT_PROBATION] == cold_backfill;
+    ok &= moe_cache_policy_lists_ok(p4);
+
+    char freed_weights[32] = {};
+    char live_weights[32] = {};
+    moe_cache_pool p5;
+    p5.n_slots = 2;
+    p5.slots.assign(p5.n_slots, moe_cache_slot{});
+    const uint64_t layer6 = moe_cache_frequency_base(&anchor_a, 6);
+    const uint64_t layer7 = moe_cache_frequency_base(&anchor_a, 7);
+    moe_cache_slot_assign(p5, p5.n_used, 500, cold_key, layer6, live_weights, freed_weights + 4, 8, 6, 0, false,
+                          MOE_CACHE_SEGMENT_PROTECTED);
+    p5.slots[p5.n_used].residency = MOE_CACHE_RESIDENCY_PAIR;
+    p5.slots[p5.n_used].valid = true;
+    p5.map[500] = p5.n_used++;
+    moe_cache_slot_assign(p5, p5.n_used, 501, hot_key, layer7, live_weights + 8, nullptr, 8, 7, 0, false);
+    p5.slots[p5.n_used].valid = true;
+    p5.map[501] = p5.n_used++;
+    g.resident_pair[6][0] = 1;
+    ok &= moe_cache_pool_invalidate_range(p5, freed_weights, sizeof(freed_weights));
+    ok &= !p5.map.count(500) && p5.map.count(501);
+    ok &= !p5.slots[0].valid && moe_cache_layer_count(p5, layer6) == 0
+        && moe_cache_layer_count(p5, layer7) == 1;
+    ok &= g.resident_pair[6][0] == 0;
+    ok &= p5.lru_head[MOE_CACHE_SEGMENT_PROBATION] == 0;
+    ok &= moe_cache_policy_lists_ok(p5);
+
+    memset(d.frequency, 0, sizeof(d.frequency));
+    memset(d.frequency_doorkeeper, 0, sizeof(d.frequency_doorkeeper));
+    d.frequency_samples = 0;
+    d.frequency_sample_limit = 4;
+    for (int i = 0; i < 5; i++) moe_cache_frequency_record(d, cold_key);
+    ok &= d.frequency_samples == 1;
+
+    g.layer_quota_pct = quota_pct;
+    MOE_CACHE_LOG("[moe-cache-selftest] policy %s\n", ok ? "OK" : "FAIL");
+    return ok;
+}
 
 static bool moe_cache_selftest_one(int di, ggml_type wtype, int64_t n_in, int64_t n_out,
                              int n_hits, bool shared_act) {
@@ -1732,6 +2335,17 @@ void ggml_moe_cache_register(void) {
     const char * v = getenv("GGML_CUDA_MOE_CACHE");
     g.enabled = !(v && atoi(v) <= 0);
     if (!g.enabled) return;
+    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_LAYER_QUOTA_PCT")) {
+        const int pct = atoi(e);
+        if (pct >= 0 && pct <= 100) g.layer_quota_pct = pct;
+    }
+    const char * selftest_env = getenv("GGML_CUDA_MOE_CACHE_SELFTEST");
+    const bool run_selftest = selftest_env && atoi(selftest_env) > 0;
+    if (run_selftest && !moe_cache_policy_selftest()) {
+        MOE_CACHE_LOG("[moe-cache-selftest] policy failure disabled the cache\n");
+        g.enabled = false;
+        return;
+    }
 
     int dev_count = 0;
     cudaGetDeviceCount(&dev_count);
@@ -1741,7 +2355,6 @@ void ggml_moe_cache_register(void) {
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_NDEV"))      { int n = atoi(e); if (n > 0 && n < g.n_dev) g.n_dev = n; }
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_BUDGET_MB")) g.budget_mb = (size_t)atoll(e);
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_INSERTS"))   g.inserts_per_plan = atoi(e);
-    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_THROTTLE"))  { g.throttle_mod = atoi(e); if (g.throttle_mod < 1) g.throttle_mod = 1; }
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_WORKERS"))   { int n = atoi(e); if (n > 0 && n <= 16) g.n_workers = n; }
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_STATS"))     g.stats_every = atoi(e);
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB")) g.min_expert_bytes = (size_t)atoll(e) << 10;
@@ -1767,11 +2380,11 @@ void ggml_moe_cache_register(void) {
     ggml_moe_cache.node_time         = moe_cache_node_time;
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_REDIRECT")) g.redirect_on = atoi(e) > 0;
 
-    MOE_CACHE_LOG("[moe-cache] enabled: n_dev=%d budget=%s inserts/plan=%d workers=%d stats_every=%d\n",
+    MOE_CACHE_LOG("[moe-cache] enabled: n_dev=%d budget=%s inserts/plan=%d workers=%d stats_every=%d layer-quota=%d%%\n",
             g.n_dev, g.budget_mb ? "env" : "auto-70%-free", g.inserts_per_plan,
-            g.n_workers, g.stats_every);
+            g.n_workers, g.stats_every, g.layer_quota_pct);
 
-    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_SELFTEST"); e && atoi(e) > 0) {
+    if (run_selftest) {
         moe_cache_selftest();
     }
 }
