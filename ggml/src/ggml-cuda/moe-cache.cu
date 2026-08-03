@@ -1541,6 +1541,11 @@ static void moe_cache_invalidate(const void * base, size_t size) {
 // ---- API: node wall-time samples (bail-out) ---------------------------------------------
 
 static void moe_cache_node_time(int code, int64_t us) {
+    // Do nothing. Never disable moe cache.
+}
+
+/*
+static void moe_cache_node_time(int code, int64_t us) {
     if (g.bail.tripped) return;
     auto & b = g.bail;
     if (code == -3) {
@@ -1568,6 +1573,7 @@ static void moe_cache_node_time(int code, int64_t us) {
         b.strikes = 0;
     }
 }
+*/
 
 // ---- API: stats ----------------------------------------------------------------------
 
