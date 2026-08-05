@@ -2328,6 +2328,11 @@ static void moe_cache_selftest(void) {
 // ---- registration ----------------------------------------------------------------------
 
 void ggml_moe_cache_register(void) {
+    // GGML_VK_MOE_CACHE_PORT_BEGIN
+    // ggml_moe_cache is process-global; explicit Vulkan selection wins.
+    const char * vk_cache = getenv("GGML_VK_MOE_CACHE");
+    if (vk_cache && atoi(vk_cache) > 0) return;
+    // GGML_VK_MOE_CACHE_PORT_END
     // always-on auto mode: active unless explicitly disabled. Engagement is
     // still gated per model (expert size, type allowlist, census) and a
     // baseline-sampled bail-out disables the cache if it ever measures itself

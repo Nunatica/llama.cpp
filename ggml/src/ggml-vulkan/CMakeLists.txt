@@ -61,6 +61,10 @@ if (Vulkan_FOUND)
 
     ggml_add_backend_library(ggml-vulkan
                              ggml-vulkan.cpp
+                             # GGML_VK_MOE_CACHE_PORT_BEGIN
+                             moe-cache.cpp
+                             moe-cache.hpp
+                             # GGML_VK_MOE_CACHE_PORT_END
                              ../../include/ggml-vulkan.h
                             )
 

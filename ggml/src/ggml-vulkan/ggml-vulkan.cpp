@@ -1,4 +1,7 @@
 #include "ggml-vulkan.h"
+// GGML_VK_MOE_CACHE_PORT_BEGIN
+#include "moe-cache.hpp"
+// GGML_VK_MOE_CACHE_PORT_END
 #include <vulkan/vulkan_core.h>
 #if defined(GGML_VULKAN_RUN_TESTS) || defined(GGML_VULKAN_CHECK_RESULTS)
 #include <chrono>
@@ -18451,6 +18454,9 @@ ggml_backend_reg_t ggml_backend_vk_reg() {
     };
     try {
         ggml_vk_instance_init();
+        // GGML_VK_MOE_CACHE_PORT_BEGIN
+        ggml_vk_moe_cache_register();
+        // GGML_VK_MOE_CACHE_PORT_END
         return &reg;
     } catch (const vk::SystemError& e) {
         VK_LOG_DEBUG("ggml_backend_vk_reg() -> Error: System error: " << e.what());
