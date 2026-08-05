@@ -2481,6 +2481,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                     throw std::invalid_argument("error: invalid value for n_parallel\n");
                 }
                 params.n_parallel = value;
+                if (value > 1) {
+#if defined(_WIN32)
+                    _putenv_s("GGML_CUDA_MOE_CACHE", "0");
+#else
+                    setenv("GGML_CUDA_MOE_CACHE", "0", 1);
+#endif
+                    LOG_WRN("moe-cache: disabled because --parallel=%d; the two-tier prototype is single-context only\n", value);
+                }
             }
         ).set_env("LLAMA_ARG_N_PARALLEL").set_examples({LLAMA_EXAMPLE_SERVER}));
     } else {
@@ -2489,6 +2497,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             string_format("number of parallel sequences to decode (default: %d)", params.n_parallel),
             [](common_params & params, int value) {
                 params.n_parallel = value;
+                if (value > 1) {
+#if defined(_WIN32)
+                    _putenv_s("GGML_CUDA_MOE_CACHE", "0");
+#else
+                    setenv("GGML_CUDA_MOE_CACHE", "0", 1);
+#endif
+                    LOG_WRN("moe-cache: disabled because --parallel=%d; the two-tier prototype is single-context only\n", value);
+                }
             }
         ).set_env("LLAMA_ARG_N_PARALLEL"));
     }
@@ -2699,10 +2715,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             };
             if (value == 0) {
                 set_env_var("GGML_CUDA_MOE_CACHE", "0");
+            } else if (params.n_parallel > 1) {
+                set_env_var("GGML_CUDA_MOE_CACHE", "0");
+                LOG_WRN("moe-cache: disabled because --parallel=%d; the two-tier prototype is single-context only\n",
+                        params.n_parallel);
             } else {
+                set_env_var("GGML_CUDA_MOE_CACHE", "1");
                 set_env_var("GGML_CUDA_MOE_CACHE_BUDGET_MB", std::to_string(value).c_str());
             }
-            (void) params;
         }
     ).set_env("LLAMA_ARG_MOE_CACHE"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0

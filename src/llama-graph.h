@@ -726,6 +726,8 @@ struct llm_graph_params {
     ggml_backend_sched_t sched;
     ggml_backend_t backend_cpu;
 
+    uint64_t moe_cache_generation = 0;
+
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
@@ -785,6 +787,10 @@ struct llm_graph_params {
         }
 
         if (!can_reuse_ubatch) {
+            return false;
+        }
+
+        if (moe_cache_generation != other.moe_cache_generation) {
             return false;
         }
 

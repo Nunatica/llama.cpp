@@ -1092,6 +1092,50 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         }
     }
 
+    // A HIGH-cache layer must be assigned before the expansion passes so its
+    // gate/up/down chain follows the ordinary GPU graph path.
+    if (ggml_moe_cache.high_backend) {
+        // Allocate all persistent buffers first. This pass never rewrites graph
+        // sources, so graph visited/use-count metadata remains valid.
+        if (ggml_moe_cache.high_preflight) {
+            for (int i = 0; i < graph->n_nodes; ++i) {
+                struct ggml_tensor * node = graph->nodes[i];
+                const int requested = ggml_moe_cache.high_backend(node);
+                if (requested <= 0) continue;
+                const int backend_id = requested - 1;
+                if (backend_id < 0 || backend_id >= sched->n_backends - 1) continue;
+                if (!ggml_backend_supports_op(sched->backends[backend_id], node)) continue;
+                ggml_moe_cache.high_preflight(node, (void *) sched->backends[backend_id],
+                                              (void *) sched->bufts[backend_id]);
+            }
+        }
+
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            struct ggml_tensor * node = graph->nodes[i];
+            const int requested = ggml_moe_cache.high_backend(node);
+            if (requested <= 0) continue;
+
+            int backend_id = requested - 1;
+            if (backend_id < 0 || backend_id >= sched->n_backends - 1 ||
+                !ggml_backend_supports_op(sched->backends[backend_id], node)) {
+                backend_id = -1;
+                for (int b = 0; b < sched->n_backends - 1; ++b) {
+                    if (ggml_backend_supports_op(sched->backends[b], node)) {
+                        backend_id = b;
+                        break;
+                    }
+                }
+            }
+            if (backend_id >= 0) {
+                if (ggml_moe_cache.high_ready && !ggml_moe_cache.high_ready(node)) {
+                    continue;
+                }
+                tensor_backend_id(node) = backend_id;
+                SET_CAUSE(node, "1.moe-high");
+            }
+        }
+    }
+
     // pass 2: expand current backend assignments
     // assign the same backend to adjacent nodes
     // expand gpu backends (i.e. non last prio) up and down, ignoring cpu (the lowest priority backend)
@@ -1379,6 +1423,16 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         for (int c = 0; c < sched->n_copies; c++) {
                             struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
                             ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
+
+                            // HIGH owns the backend buffer, while the scheduler continues to
+                            // own this graph-local tensor metadata. Preallocated tensors are
+                            // left untouched by the graph allocator and the compute-copy hook
+                            // skips the ordinary selective/full copy.
+                            if (ggml_moe_cache.high_bind_copy) {
+                                ggml_moe_cache.high_bind_copy(src, tensor_copy,
+                                                              (void *) backend,
+                                                              (void *) sched->bufts[cur_backend_id]);
+                            }
                             if (sched->n_copies > 1) {
                                 ggml_set_input(tensor_copy);
                                 ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
@@ -1594,6 +1648,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
+                }
+
+                // HIGH-cache weights use the scheduler's ordinary, canonical
+                // GPU tensor. Fill the whole tensor once and retain the copy;
+                // do not enter the selective-expert copy path on later tokens.
+                if (ggml_moe_cache.high_prepare) {
+                    const int action = ggml_moe_cache.high_prepare(input, input_cpy);
+                    if (action == 2) {
+                        continue;
+                    }
+                    if (action == 1) {
+                        ggml_backend_tensor_set_async(split_backend, input_cpy,
+                                                      input->data, 0, ggml_nbytes(input));
+                        if (ggml_moe_cache.high_commit) {
+                            ggml_moe_cache.high_commit(input, input_cpy);
+                        }
+                        continue;
+                    }
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
@@ -1954,8 +2026,13 @@ enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, st
     return err;
 }
 
+uint64_t ggml_backend_moe_cache_generation(void) {
+    return ggml_moe_cache.high_generation ? ggml_moe_cache.high_generation() : 0;
+}
+
 enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     GGML_ASSERT(sched);
+
     if (!sched->is_reset && !sched->is_alloc) {
         ggml_backend_sched_reset(sched);
     }

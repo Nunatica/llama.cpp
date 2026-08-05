@@ -309,6 +309,11 @@ struct moe_cache_global {
 // process exit; running its destructor would tear a condition variable out
 // from under a waiting thread (observed as a hang in atexit).
 static moe_cache_global & g = *new moe_cache_global();
+// Implemented after the LOW-cache helpers in moe-cache-layer.inc. Workers call
+// it while holding g.mu; the HIGH implementation never acquires g.mu while its
+// own mutex is held.
+static bool moe_high_layer_active(int blk);
+
 
 // GGML_CUDA_MOE_CACHE_DEBUG=1: trace the first calls of each API to locate stalls
 static int g_dbg = -1;
@@ -786,7 +791,12 @@ static void moe_cache_worker_main(int wid) {
             moe_cache_slot & s = p.slots[job.slot_idx];
             if (s.queued && s.key == job.key) {
                 s.queued = false;
-                if (err == cudaSuccess) {
+                if (err == cudaSuccess && moe_high_layer_active(job.blk)) {
+                    // Promotion completed while this LOW fill was in flight.
+                    // Discard it instead of reintroducing duplicate residency.
+                    p.map.erase(s.key);
+                    moe_cache_slot_clear(p, job.slot_idx);
+                } else if (err == cudaSuccess) {
                     if (job.blk >= 0 && job.blk < 1024 && job.eid >= 0 && job.eid < 256) {
                         (job.src_gate ? g.resident_pair : g.resident_down)[job.blk][job.eid >> 6]
                             |= 1ull << (job.eid & 63);
@@ -919,6 +929,8 @@ static bool moe_cache_pool_alloc(int di, size_t expert_size, int wtype, size_t b
     return true;
 }
 
+#include "moe-cache-layer.inc"
+
 // ---- API: begin -----------------------------------------------------------------
 
 static int moe_cache_begin(const char * name, const void * host_base, size_t expert_size,
@@ -974,11 +986,13 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
     const int blk = atoi(p + 4);
 
     int role = -1;
-    if      (strstr(name, "_gate_exps")) role = 0;
-    else if (strstr(name, "_up_exps"))   role = 1;
-    else if (strstr(name, "_down_exps")) role = 2;
+    if      (strstr(name, "_gate_up_exps")) role = 3;
+    else if (strstr(name, "_gate_exps"))    role = 0;
+    else if (strstr(name, "_up_exps"))      role = 1;
+    else if (strstr(name, "_down_exps"))    role = 2;
 
     const int di = blk % g.n_dev;
+    moe_high_note_begin(name, host_base, expert_size, n_expert, n_tokens);
 
     const uint64_t kb = moe_cache_fnv1a(name);
     moe_cache_device & d = g.dev[di];
@@ -1066,6 +1080,9 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
             if (g.budget_mb > 0 && (g.budget_mb << 20) < avail) {
                 avail = g.budget_mb << 20;
             }
+            // LOW and HIGH are both hard-limited to at most 50% of this total.
+            // HIGH uses normal scheduler tensor copies; LOW owns the pools below.
+            avail = moe_high_set_device_budget(di, avail);
             // Role-group budgeting. Mixed-quant models (UD-*_XL) fragment one
             // role into many (size, type) shapes; naive per-shape weighting
             // hands each fragment a sliver below the slot floor and the whole
@@ -1162,11 +1179,13 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
     }
 
     // bail-out phases (decode visits on a working pool only)
+    /*
     if (!g.bail.tripped) {
         const long long vis = g.bail.eligible_seen++;
         if (vis < moe_cache_global::BAIL_WARM) return -1;        // warmup: no sample
         if (vis < moe_cache_global::BAIL_SAMPLE) return -3;      // pure CPU + timing sample
     }
+    */
 
     // paired pools share ONE entry per (blk, expert): key by blk + the GATE
     // tensor's host base (two models in one process must never alias — names
@@ -1214,6 +1233,7 @@ static int moe_cache_plan(int di, const int32_t * ids, int n_ids, int32_t * slot
         for (int k = 0; k < n_ids && k < 64; k++) g.cur_slot_idx[k] = slot_idx[k];
         d.t_plan_us += ggml_time_us() - t0;
         d.n_nodes++;
+        moe_high_note_plan(g.cur_blk, g.cur_role, nh == n_ids);
         return nh;
     }
 
@@ -1347,6 +1367,7 @@ static int moe_cache_plan(int di, const int32_t * ids, int n_ids, int32_t * slot
     d.t_plan_us += ggml_time_us() - t0;
     d.n_nodes++;
     MOE_CACHE_DBG("[moe-cache-dbg] plan dev=%d hits=%d q=%zu\n", di, n_hits, g.queue.size());
+    moe_high_note_plan(g.cur_blk, g.cur_role, n_hits == n_ids);
     return n_hits;
 }
 
@@ -1836,6 +1857,7 @@ static bool moe_cache_pool_invalidate_range(moe_cache_pool & p, const void * bas
 
 static void moe_cache_invalidate(const void * base, size_t size) {
     if (!g.enabled) return;
+    moe_high_invalidate(base, size);
     auto in_range = [&](const void * p) {
         return moe_cache_source_overlaps(p, 1, base, size);
     };
@@ -2007,8 +2029,10 @@ static void moe_cache_stats(void) {
             MOE_CACHE_LOG("[moe-cache] dev=%d redirect: claims=%lld miss-rows-up=%lld fused-layers=%lld\n",
                     i, d.redirect_claims, d.redirect_misses_up, d.fused_layers);
             if (i == 0) {
+                /*
                 MOE_CACHE_LOG("[moe-cache] bail-ewma: base=%.1fus(n=%lld) on=%.1fus(n=%lld)\n",
                         g.bail.base_ewma, g.bail.base_n, g.bail.on_ewma, g.bail.on_n);
+                */
             }
         }
     }
@@ -2353,6 +2377,7 @@ void ggml_moe_cache_register(void) {
 
     g.n_dev = dev_count > MOE_CACHE_MAX_DEV ? MOE_CACHE_MAX_DEV : dev_count;
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_NDEV"))      { int n = atoi(e); if (n > 0 && n < g.n_dev) g.n_dev = n; }
+    moe_high_configure();
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_BUDGET_MB")) g.budget_mb = (size_t)atoll(e);
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_INSERTS"))   g.inserts_per_plan = atoi(e);
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_WORKERS"))   { int n = atoi(e); if (n > 0 && n <= 16) g.n_workers = n; }
@@ -2377,6 +2402,13 @@ void ggml_moe_cache_register(void) {
     ggml_moe_cache.redirect_finalize = moe_cache_redirect_finalize;
     ggml_moe_cache.glu_hits          = moe_cache_glu_hits;
     ggml_moe_cache.invalidate        = moe_cache_invalidate;
+    ggml_moe_cache.high_backend      = moe_high_backend;
+    ggml_moe_cache.high_preflight    = moe_high_preflight;
+    ggml_moe_cache.high_ready        = moe_high_ready;
+    ggml_moe_cache.high_bind_copy    = moe_high_bind_copy;
+    ggml_moe_cache.high_prepare      = moe_high_prepare;
+    ggml_moe_cache.high_commit       = nullptr;
+    ggml_moe_cache.high_generation   = moe_high_generation;
     ggml_moe_cache.node_time         = moe_cache_node_time;
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_REDIRECT")) g.redirect_on = atoi(e) > 0;
 

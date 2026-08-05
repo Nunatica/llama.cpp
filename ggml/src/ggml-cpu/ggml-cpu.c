@@ -1570,7 +1570,7 @@ static void ggml_compute_forward_mul_mat_id(
     // MoE expert cache state (set on thread 0 only; other threads keep dev = -1)
     enum { MOE_CACHE_MAX_TOPK = 64 };
     int           moe_cache_dev = -1;
-    int64_t       moe_cache_t0 = 0;
+    //int64_t       moe_cache_t0 = 0;
     int           moe_cache_n_hits = 0;
     int32_t       moe_cache_slot_idx[MOE_CACHE_MAX_TOPK];   // per-k slot index, -1 = miss
     int32_t       moe_cache_compact[MOE_CACHE_MAX_TOPK];    // slot indices of hits, in order
@@ -1639,7 +1639,7 @@ static void ggml_compute_forward_mul_mat_id(
         // at the end of this function, before the node completes.
         if (ggml_moe_cache.begin && src1->type == GGML_TYPE_F32 &&
             n_ids * ids->ne[1] <= MOE_CACHE_MAX_TOPK) {
-            moe_cache_t0 = ggml_time_us();
+            //moe_cache_t0 = ggml_time_us();
             moe_cache_dev = ggml_moe_cache.begin(src0->name, src0->data, nb02,
                                                  ne00, ne01, (int) type, ne02, ids->ne[1]);
             if (moe_cache_dev >= 0) {
@@ -1768,11 +1768,14 @@ static void ggml_compute_forward_mul_mat_id(
     if (moe_cache_dev >= 0 && moe_cache_n_hits > 0) {
         ggml_moe_cache.collect(moe_cache_dev, moe_cache_n_hits, moe_cache_rows, ne0);
     }
+
     // bail-out judge: node wall-time samples for both phases (-3 = pure-CPU
     // baseline window, >= 0 = cache-engaged)
+    /*
     if (ith == 0 && ggml_moe_cache.node_time && (moe_cache_dev >= 0 || moe_cache_dev == -3)) {
         ggml_moe_cache.node_time(moe_cache_dev, ggml_time_us() - moe_cache_t0);
     }
+    */
 }
 
 /////////////////////////////////

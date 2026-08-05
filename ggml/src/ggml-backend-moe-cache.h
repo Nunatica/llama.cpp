@@ -17,6 +17,9 @@
 extern "C" {
 #endif
 
+
+struct ggml_tensor;
+
 struct ggml_moe_cache_api {
     // Decide whether the cache engages for this MUL_MAT_ID node.
     // Returns the device id to use (>= 0) or -1 to stay on the pure-CPU path.
@@ -80,6 +83,39 @@ struct ggml_moe_cache_api {
     // insert jobs sourced from the range and resets per-block tensor-base
     // learning. Must be called before the memory is unmapped/freed.
     void (*invalidate)(const void * base, size_t size);
+
+    // ---- complete-layer HIGH cache -----------------------------------------
+    // Returns device ordinal + 1 when a MUL_MAT_ID node belongs to a layer that
+    // is being promoted or is HIGH resident. Zero keeps normal assignment.
+    int (*high_backend)(const struct ggml_tensor * node);
+
+    // Allocate persistent layer-owned backend buffers without changing graph
+    // tensor pointers. backend and buft are opaque here so this bridge does not
+    // depend on ggml-backend.h.
+    int (*high_preflight)(struct ggml_tensor * node, void * backend, void * buft);
+
+    // Non-zero only after every required gate/up/down buffer for this layer was
+    // prepared. The scheduler must not force a partially prepared layer.
+    int (*high_ready)(const struct ggml_tensor * node);
+
+    // Bind scheduler-owned copy-tensor metadata to the persistent HIGH buffer.
+    // Returns non-zero when normal graph allocation and input copying should be
+    // skipped for this tensor.
+    int (*high_bind_copy)(const struct ggml_tensor * host,
+                          struct ggml_tensor * gpu_copy,
+                          void * backend,
+                          void * buft);
+    // Called for a host weight split input and its normal GPU copy:
+    //   0 = use normal/selective copy, 1 = issue a complete copy, 2 = skip copy.
+    int (*high_prepare)(const struct ggml_tensor * host,
+                        const struct ggml_tensor * gpu_copy);
+    // Records a complete copy after the scheduler enqueues it. Once every
+    // gate/up/down tensor is committed, the layer becomes HIGH resident.
+    void (*high_commit)(const struct ggml_tensor * host,
+                        const struct ggml_tensor * gpu_copy);
+    // Changes whenever promotion/demotion requires the scheduler graph to be
+    // split and allocated again.
+    uint64_t (*high_generation)(void);
 
     // Node wall-time sample for the bail-out judge. code is begin()'s return
     // value: -3 = pure-CPU baseline sample, >= 0 = cache-engaged sample.
