@@ -187,10 +187,8 @@ struct moe_cache_global {
     int    inserts_per_plan = 8; // max inserts enqueued per plan() call
     int    queue_max        = 512;
     int    n_workers        = 4;
-    size_t min_expert_bytes = 1u << 20; // skip models whose experts are too small
-                                        // to amortize per-node dispatch (measured:
-                                        // 0.45MB experts lose, 3MB+ win big)
-    int    max_batch        = 1; // decode batches up to this size use the cache
+    size_t min_expert_bytes = 1u << 18; // skip models whose experts are too small (default: 256 KiB)
+    int    max_batch        = 3; // decode batches up to this size use the cache
                                  // (GGML_CUDA_MOE_CACHE_MAX_BATCH; >1 for spec-verify/parallel)
     int    stats_every      = 0; // log every N collect() calls (0 = off)
     int    layer_quota_pct  = 25; // pool share reserved as equal per-layer floors (GGML_CUDA_MOE_CACHE_LAYER_QUOTA_PCT)
