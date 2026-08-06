@@ -1770,9 +1770,11 @@ static void ggml_compute_forward_mul_mat_id(
     }
     // bail-out judge: node wall-time samples for both phases (-3 = pure-CPU
     // baseline window, >= 0 = cache-engaged)
+    /*
     if (ith == 0 && ggml_moe_cache.node_time && (moe_cache_dev >= 0 || moe_cache_dev == -3)) {
         ggml_moe_cache.node_time(moe_cache_dev, ggml_time_us() - moe_cache_t0);
     }
+    */
 }
 
 /////////////////////////////////

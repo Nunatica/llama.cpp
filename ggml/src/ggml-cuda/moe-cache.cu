@@ -1160,11 +1160,13 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
     }
 
     // bail-out phases (decode visits on a working pool only)
+    /*
     if (!g.bail.tripped) {
         const long long vis = g.bail.eligible_seen++;
         if (vis < moe_cache_global::BAIL_WARM) return -1;        // warmup: no sample
         if (vis < moe_cache_global::BAIL_SAMPLE) return -3;      // pure CPU + timing sample
     }
+    */
 
     // paired pools share ONE entry per (blk, expert): key by blk + the GATE
     // tensor's host base (two models in one process must never alias — names
@@ -2004,10 +2006,13 @@ static void moe_cache_stats(void) {
                     (double)(d.t_plan_us + d.t_disp_us + d.t_coll_us) / d.n_nodes);
             MOE_CACHE_LOG("[moe-cache] dev=%d redirect: claims=%lld miss-rows-up=%lld fused-layers=%lld\n",
                     i, d.redirect_claims, d.redirect_misses_up, d.fused_layers);
+
+            /*
             if (i == 0) {
                 MOE_CACHE_LOG("[moe-cache] bail-ewma: base=%.1fus(n=%lld) on=%.1fus(n=%lld)\n",
                         g.bail.base_ewma, g.bail.base_n, g.bail.on_ewma, g.bail.on_n);
             }
+            */
         }
     }
 }
