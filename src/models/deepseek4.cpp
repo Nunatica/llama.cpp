@@ -1336,6 +1336,21 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
             exp_probs_b = nullptr;
         }
 
+        ggml_tensor * ffn_shexp = build_ffn(cur,
+                layer.ffn_up_shexp, nullptr, nullptr,
+                layer.ffn_gate_shexp, nullptr, nullptr,
+                layer.ffn_down_shexp, nullptr, nullptr,
+                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+
+        const bool routed_cpu = ggml_backend_buffer_is_host(layer.ffn_gate_exps->buffer) &&
+                ggml_backend_buffer_is_host(layer.ffn_up_exps->buffer) &&
+                ggml_backend_buffer_is_host(layer.ffn_down_exps->buffer);
+        const bool shared_gpu = !ggml_backend_buffer_is_host(layer.ffn_gate_shexp->buffer) &&
+                !ggml_backend_buffer_is_host(layer.ffn_up_shexp->buffer) &&
+                !ggml_backend_buffer_is_host(layer.ffn_down_shexp->buffer);
+        const bool overlap_moe = n_tokens <= 8 && routed_cpu && shared_gpu;
+        cb(ffn_shexp, overlap_moe ? "dsv4_ffn_shexp_overlap" : "ffn_shexp", il);
+
         ggml_tensor * moe_out = build_moe_ffn(cur,
                 layer.ffn_gate_inp,
                 layer.ffn_up_exps,
@@ -1352,15 +1367,9 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 nullptr,
                 nullptr,
                 nullptr,
-                selected_experts);
-        cb(moe_out, "ffn_moe_out", il);
-
-        ggml_tensor * ffn_shexp = build_ffn(cur,
-                layer.ffn_up_shexp, nullptr, nullptr,
-                layer.ffn_gate_shexp, nullptr, nullptr,
-                layer.ffn_down_shexp, nullptr, nullptr,
-                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
-        cb(ffn_shexp, "ffn_shexp", il);
+                selected_experts,
+                overlap_moe ? ffn_shexp : nullptr);
+        cb(moe_out, overlap_moe ? "dsv4_ffn_moe_out_overlap" : "ffn_moe_out", il);
 
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
         cb(cur, "ffn_out", il);
@@ -1493,6 +1502,21 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
     cb(cur, "mtp_ffn_norm", il);
 
     GGML_ASSERT((uint32_t) il >= hparams.dsv4_hash_layer_count && "DEEPSEEK4 MTP does not support hash-routed MTP blocks");
+    ggml_tensor * ffn_shexp = build_ffn(cur,
+            layer.ffn_up_shexp, nullptr, nullptr,
+            layer.ffn_gate_shexp, nullptr, nullptr,
+            layer.ffn_down_shexp, nullptr, nullptr,
+            nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+
+    const bool routed_cpu = ggml_backend_buffer_is_host(layer.ffn_gate_exps->buffer) &&
+            ggml_backend_buffer_is_host(layer.ffn_up_exps->buffer) &&
+            ggml_backend_buffer_is_host(layer.ffn_down_exps->buffer);
+    const bool shared_gpu = !ggml_backend_buffer_is_host(layer.ffn_gate_shexp->buffer) &&
+            !ggml_backend_buffer_is_host(layer.ffn_up_shexp->buffer) &&
+            !ggml_backend_buffer_is_host(layer.ffn_down_shexp->buffer);
+    const bool overlap_moe = n_tokens <= 8 && routed_cpu && shared_gpu;
+    cb(ffn_shexp, overlap_moe ? "dsv4_mtp_ffn_shexp_overlap" : "mtp_ffn_shexp", il);
+
     ggml_tensor * moe_out = build_moe_ffn(cur,
             layer.ffn_gate_inp,
             layer.ffn_up_exps,
@@ -1503,15 +1527,15 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
             LLM_FFN_SILU, hparams.expert_weights_norm,
             hparams.expert_weights_scale,
             (llama_expert_gating_func_type) hparams.expert_gating_func,
-            il);
-    cb(moe_out, "mtp_ffn_moe_out", il);
-
-    ggml_tensor * ffn_shexp = build_ffn(cur,
-            layer.ffn_up_shexp, nullptr, nullptr,
-            layer.ffn_gate_shexp, nullptr, nullptr,
-            layer.ffn_down_shexp, nullptr, nullptr,
-            nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
-    cb(ffn_shexp, "mtp_ffn_shexp", il);
+            il,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            overlap_moe ? ffn_shexp : nullptr);
+    cb(moe_out, overlap_moe ? "dsv4_mtp_ffn_moe_out_overlap" : "mtp_ffn_moe_out", il);
 
     cur = ggml_add(ctx0, moe_out, ffn_shexp);
     cb(cur, "mtp_ffn_out", il);

@@ -1887,7 +1887,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         ggml_tensor * parallel_ffn) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -1908,7 +1909,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         up_exps_s,
         gate_exps_s,
         down_exps_s,
-        selected_experts_in
+        selected_experts_in,
+        parallel_ffn
     );
 }
 
@@ -1936,7 +1938,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         ggml_tensor * parallel_ffn) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -2073,8 +2076,34 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(weights, "ffn_moe_weights_scaled", il);
     }
 
-    //call early so that topk-moe can be used
+    // call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
+
+    const char * parallel_ffn_start_name = nullptr;
+    if (parallel_ffn) {
+        ggml_tensor * cur_cpu = ggml_dup(ctx0, cur);
+        cb(cur_cpu, "ffn_moe_inp_cpu", il);
+        ggml_backend_sched_set_tensor_backend(sched, cur_cpu, backend_cpu);
+
+        ggml_tensor * selected_experts_cpu = ggml_dup(ctx0, selected_experts);
+        cb(selected_experts_cpu, "ffn_moe_topk_cpu", il);
+        ggml_backend_sched_set_tensor_backend(sched, selected_experts_cpu, backend_cpu);
+
+        ggml_tensor * weights_cpu = ggml_dup(ctx0, weights);
+        cb(weights_cpu, "ffn_moe_weights_cpu", il);
+        ggml_backend_sched_set_tensor_backend(sched, weights_cpu, backend_cpu);
+
+        ggml_build_forward_expand(gf, cur_cpu);
+        ggml_build_forward_expand(gf, selected_experts_cpu);
+        ggml_build_forward_expand(gf, weights_cpu);
+        ggml_build_forward_expand(gf, parallel_ffn);
+
+        parallel_ffn_start_name = strstr(ggml_get_name(parallel_ffn), "dsv4_mtp_") != nullptr ?
+                "dsv4_mtp_ffn_moe_start_overlap" : "dsv4_ffn_moe_start_overlap";
+        cur              = cur_cpu;
+        selected_experts = selected_experts_cpu;
+        weights          = weights_cpu;
+    }
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
@@ -2091,7 +2120,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
         ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
-        cb(gate_up, "ffn_moe_gate_up", il);
+        cb(gate_up, parallel_ffn_start_name ? parallel_ffn_start_name : "ffn_moe_gate_up", il);
 
         if (up_exps_s) {
             cb(gate_up, "ffn_moe_gate_up_scaled", il);
@@ -2110,7 +2139,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     } else {
         // separate gate and up path
         up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
-        cb(up, "ffn_moe_up", il);
+        cb(up, parallel_ffn_start_name ? parallel_ffn_start_name : "ffn_moe_up", il);
 
         if (up_exps_s) {
             cb(up, "ffn_moe_up_scaled", il);

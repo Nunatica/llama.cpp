@@ -47,6 +47,14 @@
 #define MOE_CACHE_FREQ_WIDTH 8192
 #define MOE_CACHE_VICTIM_SCAN 64
 
+#if defined(GGML_USE_HIP)
+#define MOE_CACHE_EVENT_ELAPSED_TIME hipEventElapsedTime
+#elif defined(GGML_USE_MUSA)
+#define MOE_CACHE_EVENT_ELAPSED_TIME musaEventElapsedTime
+#else
+#define MOE_CACHE_EVENT_ELAPSED_TIME cudaEventElapsedTime
+#endif
+
 static_assert((MOE_CACHE_FREQ_WIDTH & (MOE_CACHE_FREQ_WIDTH - 1)) == 0, "frequency width must be a power of two");
 
 enum moe_cache_segment {
@@ -163,6 +171,18 @@ struct moe_cache_device {
     // per-phase wall time (thread-0 serial cost), microseconds
     long long t_plan_us = 0, t_disp_us = 0, t_coll_us = 0, n_nodes = 0;
     long long redirect_claims = 0, redirect_misses_up = 0;
+
+    struct {
+        std::atomic<bool> active{false};
+        bool mtp = false;
+        int layer = -1;
+        cudaStream_t stream = nullptr;
+        cudaEvent_t shared_start_event = nullptr;
+        cudaEvent_t shared_end_event = nullptr;
+        std::atomic<bool> miss{false};
+        int64_t shared_start_us = 0;
+        int64_t routed_start_us = 0;
+    } overlap;
 };
 
 struct moe_cache_job {
@@ -308,6 +328,39 @@ struct moe_cache_global {
 // from under a waiting thread (observed as a hang in atexit).
 static moe_cache_global & g = *new moe_cache_global();
 
+static int moe_cache_overlap_layer(const char * name) {
+    const char * dash = strrchr(name, '-');
+    return dash ? atoi(dash + 1) : -1;
+}
+
+static bool moe_cache_overlap_mtp(const char * name) {
+    return strstr(name, "dsv4_mtp_") != nullptr;
+}
+
+static bool moe_cache_overlap_active(int layer) {
+    for (int di = 0; di < g.n_dev; ++di) {
+        moe_cache_device & d = g.dev[di];
+        if (d.overlap.active.load(std::memory_order_acquire) && d.overlap.layer == layer) return true;
+    }
+    return false;
+}
+
+static bool moe_cache_overlap_any_active() {
+    for (int di = 0; di < g.n_dev; ++di) {
+        if (g.dev[di].overlap.active.load(std::memory_order_acquire)) return true;
+    }
+    return false;
+}
+
+static void moe_cache_overlap_note_miss(int layer) {
+    for (int di = 0; di < g.n_dev; ++di) {
+        moe_cache_device & d = g.dev[di];
+        if (d.overlap.active.load(std::memory_order_acquire) && d.overlap.layer == layer) {
+            d.overlap.miss.store(true, std::memory_order_release);
+        }
+    }
+}
+
 // GGML_CUDA_MOE_CACHE_DEBUG=1: trace the first calls of each API to locate stalls
 static int g_dbg = -1;
 static long long g_dbg_n = 0;
@@ -328,6 +381,12 @@ static bool moe_cache_ok(int di, cudaError_t e, const char * what) {
                 di, what, cudaGetErrorString(e));
     }
     return false;
+}
+
+static bool moe_cache_overlap_wait_shared(int di, int layer, cudaStream_t stream) {
+    moe_cache_device & d = g.dev[di];
+    if (!d.overlap.active.load(std::memory_order_acquire) || d.overlap.layer != layer) return true;
+    return moe_cache_ok(di, cudaStreamWaitEvent(stream, d.overlap.shared_end_event, 0), "shared expert wait");
 }
 
 static uint64_t moe_cache_fnv1a(const char * s) {
@@ -980,6 +1039,12 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
 
     const uint64_t kb = moe_cache_fnv1a(name);
     moe_cache_device & d = g.dev[di];
+    // A gate node starts a new fused-state epoch, including cache-bypass paths.
+    if (role == 0) {
+        for (int fdi = 0; fdi < g.n_dev; ++fdi) {
+            g.dev[fdi].fused.active = false;
+        }
+    }
     if (d.dead) return -1;
     const bool first_sight = g_disc.seen.count(kb) == 0;
 
@@ -989,6 +1054,7 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
         if (d.pools[i].expert_size == expert_size && d.pools[i].wtype == wtype) { pi = i; break; }
     }
     if (pi < 0) {
+        moe_cache_overlap_note_miss(blk);
         moe_cache_discovery::shape * shp = nullptr;
         for (auto & sh : g_disc.pending[di]) {
             if (sh.size == expert_size && sh.wtype == wtype) { shp = &sh; break; }
@@ -1117,7 +1183,10 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
         }
         if (pi < 0) return -1;
     }
-    if (d.pools[pi].slab == nullptr) return -1;   // dead marker (alloc failed)
+    if (d.pools[pi].slab == nullptr) {
+        moe_cache_overlap_note_miss(blk);
+        return -1;
+    }
     if (!g_disc.any_repeat) {
         if (g_disc.seen.count(kb)) {
             g_disc.any_repeat = true;
@@ -1125,14 +1194,6 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
             g_disc.seen.insert(kb);
             return -1;
         }
-    }
-
-    // fused-state epoch: every gate node on a device invalidates any leftover
-    // fused entry (zero-hit gate nodes never reach collect, and gallocr reuses
-    // dst pointers across layers — a stale entry must never survive into the
-    // next layer's GLU; see MOE_CACHE_READINESS.md B1)
-    if (role == 0) {
-        g.dev[di].fused.active = false;
     }
 
     g.cur_blk  = blk;
@@ -1203,7 +1264,7 @@ static int moe_cache_plan(int di, const int32_t * ids, int n_ids, int32_t * slot
     // nobody computed.
     if (g.cur_n_tokens == 1 && p.paired && g.cur_role == 1 &&
         g.cur_blk >= 0 && g.cur_blk < 1024 && g.safe_fuse_blk[g.cur_blk] &&
-        d.fused.active && d.fused.gate_dst != nullptr) {
+        !moe_cache_overlap_active(g.cur_blk) && d.fused.active && d.fused.gate_dst != nullptr) {
         int nh = 0;
         for (int k = 0; k < n_ids && k < 64; k++) {
             const bool hit = (d.fused.mask >> k) & 1ull;
@@ -1214,6 +1275,7 @@ static int moe_cache_plan(int di, const int32_t * ids, int n_ids, int32_t * slot
         for (int k = 0; k < n_ids && k < 64; k++) g.cur_slot_idx[k] = slot_idx[k];
         d.t_plan_us += ggml_time_us() - t0;
         d.n_nodes++;
+        if (nh < n_ids) moe_cache_overlap_note_miss(g.cur_blk);
         return nh;
     }
 
@@ -1346,6 +1408,7 @@ static int moe_cache_plan(int di, const int32_t * ids, int n_ids, int32_t * slot
 
     d.t_plan_us += ggml_time_us() - t0;
     d.n_nodes++;
+    if (n_hits < n_ids) moe_cache_overlap_note_miss(g.cur_blk);
     MOE_CACHE_DBG("[moe-cache-dbg] plan dev=%d hits=%d q=%zu\n", di, n_hits, g.queue.size());
     return n_hits;
 }
@@ -1360,7 +1423,8 @@ static void moe_cache_dispatch(int di, int wtype_int, int64_t n_in, int64_t n_ou
     moe_cache_pool   & p = d.pools[g.cur_pool];
 
     const bool blk_ok     = g.cur_blk >= 0 && g.cur_blk < 1024;
-    const bool fuse_layer = g.cur_n_tokens == 1 && p.paired && blk_ok && g.safe_fuse_blk[g.cur_blk];
+    const bool fuse_layer = g.cur_n_tokens == 1 && p.paired && blk_ok && g.safe_fuse_blk[g.cur_blk] &&
+            !moe_cache_overlap_active(g.cur_blk);
     if (fuse_layer && g.cur_role == 1) {
         // fused rows were computed at the gate node; nothing to launch here
         d.t_disp_us += ggml_time_us() - t0;
@@ -1492,6 +1556,10 @@ static void moe_cache_dispatch(int di, int wtype_int, int64_t n_in, int64_t n_ou
     // note: CUDA-graph capture of this chain was tried and measured to be a
     // net loss — the chain is GPU-exec-bound, not launch-bound, and pools can
     // hold mixed (n_in, n_out) shapes which makes graph keying hazardous.
+    if (!moe_cache_overlap_wait_shared(di, g.cur_blk, st)) {
+        d.out_rows += n_hits;
+        return;
+    }
     emit_chain(st);
 
     d.out_rows += n_hits;
@@ -1541,7 +1609,7 @@ static void moe_cache_collect(int di, int n_hits, float * const * dst_rows, int6
         const char * dst_base = k0 >= 0
             ? (const char *)dst_rows[0] - (size_t)k0 * n_out * sizeof(float) : nullptr;
 
-        if (g.safe_fuse_blk[g.cur_blk]) {
+        if (g.safe_fuse_blk[g.cur_blk] && !moe_cache_overlap_active(g.cur_blk)) {
             if (g.cur_role == 0) {
                 // gate node of a fused layer: d_out holds the fused swiglu rows.
                 // D2H them (async) and hand off to the GLU hook; nothing is
@@ -1586,7 +1654,8 @@ static void moe_cache_collect(int di, int n_hits, float * const * dst_rows, int6
     // hit rows straight into it (peer write, async) and skip the D2H + host
     // scatter + thread-0 sync entirely. CPU miss rows are uploaded later in
     // redirect_finalize (after the node barrier, when they are complete).
-    if (g.redirect_on && g.cur_n_tokens == 1 && g.cur_role == 2 && n_hits > 0 && n_hits <= 64) {
+    if (g.redirect_on && !moe_cache_overlap_active(g.cur_blk) && g.cur_n_tokens == 1 &&
+        g.cur_role == 2 && n_hits > 0 && n_hits <= 64) {
         moe_cache_global::redirect_entry * re = nullptr;
         const void * base = nullptr;
         for (auto & kv : g.redirect) {
@@ -1716,7 +1785,7 @@ static unsigned long long moe_cache_glu_hits(const void * src0_data, const void 
                                        void * dst_data, size_t dst_nb1, int ith) {
     // learning: observing the GLU node whose inputs are a layer's gate/up MMID
     // dsts proves the fused dispatch is safe for that layer
-    if (!g.fuse) return 0;
+    if (!g.fuse || moe_cache_overlap_any_active()) return 0;
     if (ith == 0) {
         MOE_CACHE_DBG("[moe-cache-dbg] glu call src0=%p src1=%p\n", src0_data, src1_data);
     }
@@ -1727,7 +1796,6 @@ static unsigned long long moe_cache_glu_hits(const void * src0_data, const void 
         g.safe_fuse_blk[blk] = true;
         MOE_CACHE_DBG("[moe-cache-dbg] fuse-safe blk=%d\n", blk);
     }
-
     // active fused rows for this pair? dst buffers are reused across layers,
     // so several devices can hold matching (stale) entries — take the newest
     int best = -1;
@@ -1912,6 +1980,8 @@ static void moe_cache_invalidate(const void * base, size_t size) {
 
 static void moe_cache_node_time(int code, int64_t us) {
     // Do nothing. Never disable moe cache.
+    GGML_UNUSED(code);
+    GGML_UNUSED(us);
 }
 
 /*
@@ -1944,6 +2014,123 @@ static void moe_cache_node_time(int code, int64_t us) {
     }
 }
 */
+
+// ---- DeepSeek V4 shared/routed overlap timing ------------------------------------------
+
+static void moe_cache_overlap_shared_begin(void * backend_ptr, const char * name) {
+    ggml_backend_t backend = (ggml_backend_t) backend_ptr;
+    if (!ggml_backend_is_cuda(backend)) return;
+
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    const int di = ctx->device;
+    if (di < 0 || di >= g.n_dev || g.dev[di].dead) return;
+
+    moe_cache_device & d = g.dev[di];
+    d.overlap.active.store(false, std::memory_order_release);
+    d.overlap.mtp = moe_cache_overlap_mtp(name);
+    d.overlap.layer = moe_cache_overlap_layer(name);
+    d.overlap.stream = ctx->stream();
+    d.overlap.miss.store(false, std::memory_order_release);
+    d.overlap.routed_start_us = 0;
+
+    ggml_cuda_set_device(di);
+    if ((!d.overlap.shared_start_event &&
+         !moe_cache_ok(di, cudaEventCreateWithFlags(&d.overlap.shared_start_event, 0), "overlap start event")) ||
+        (!d.overlap.shared_end_event &&
+         !moe_cache_ok(di, cudaEventCreateWithFlags(&d.overlap.shared_end_event, 0), "overlap end event")) ||
+        !moe_cache_ok(di, cudaEventRecord(d.overlap.shared_start_event, d.overlap.stream), "overlap start record")) {
+        return;
+    }
+    d.overlap.shared_start_us = ggml_time_us();
+    d.overlap.active.store(true, std::memory_order_release);
+}
+
+static void moe_cache_overlap_shared_end(void * backend_ptr, const char * name) {
+    ggml_backend_t backend = (ggml_backend_t) backend_ptr;
+    if (!ggml_backend_is_cuda(backend)) return;
+
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    const int di = ctx->device;
+    if (di < 0 || di >= g.n_dev) return;
+
+    moe_cache_device & d = g.dev[di];
+    if (!d.overlap.active.load(std::memory_order_acquire) || d.overlap.layer != moe_cache_overlap_layer(name) ||
+        d.overlap.mtp != moe_cache_overlap_mtp(name)) {
+        return;
+    }
+
+    if (!moe_cache_ok(di, cudaEventRecord(d.overlap.shared_end_event, d.overlap.stream), "overlap end record")) {
+        d.overlap.active.store(false, std::memory_order_release);
+    }
+}
+
+static void moe_cache_overlap_routed_begin(const char * name, int64_t start_us) {
+    const int layer = moe_cache_overlap_layer(name);
+    const bool mtp = moe_cache_overlap_mtp(name);
+
+    for (int di = 0; di < g.n_dev; ++di) {
+        moe_cache_device & d = g.dev[di];
+        if (!d.overlap.active.load(std::memory_order_acquire) || d.overlap.layer != layer || d.overlap.mtp != mtp) continue;
+        d.overlap.routed_start_us = start_us;
+        return;
+    }
+}
+
+static void moe_cache_overlap_routed_end(const char * name, int64_t routed_end_us) {
+    const int layer = moe_cache_overlap_layer(name);
+    const bool mtp = moe_cache_overlap_mtp(name);
+
+    for (int di = 0; di < g.n_dev; ++di) {
+        moe_cache_device & d = g.dev[di];
+        if (!d.overlap.active.load(std::memory_order_acquire) || d.overlap.layer != layer || d.overlap.mtp != mtp) continue;
+
+        const bool miss = d.overlap.miss.load(std::memory_order_acquire);
+        if (!miss) {
+            d.overlap.active.store(false, std::memory_order_release);
+            return;
+        }
+
+        ggml_cuda_set_device(di);
+        if (!moe_cache_ok(di, cudaEventSynchronize(d.overlap.shared_end_event), "overlap timing sync")) {
+            d.overlap.active.store(false, std::memory_order_release);
+            return;
+        }
+
+        float shared_ms = 0.0f;
+        if (!moe_cache_ok(di, MOE_CACHE_EVENT_ELAPSED_TIME(&shared_ms,
+                        d.overlap.shared_start_event, d.overlap.shared_end_event), "overlap elapsed time")) {
+            d.overlap.active.store(false, std::memory_order_release);
+            return;
+        }
+
+        const int64_t shared_start_us = d.overlap.shared_start_us;
+        const int64_t routed_start_us = d.overlap.routed_start_us;
+        d.overlap.active.store(false, std::memory_order_release);
+
+        if (shared_start_us <= 0 || routed_start_us <= 0 || routed_end_us < routed_start_us) {
+            return;
+        }
+
+        if (layer == 0) {
+            const int64_t shared_us = (int64_t) (shared_ms * 1000.0f);
+            const int64_t shared_end_us = shared_start_us + shared_us;
+            const int64_t routed_us = routed_end_us - routed_start_us;
+            const int64_t overlap_start_us = std::max(shared_start_us, routed_start_us);
+            const int64_t overlap_end_us = std::min(shared_end_us, routed_end_us);
+            const int64_t overlapped_us = std::max<int64_t>(0, overlap_end_us - overlap_start_us);
+            const int64_t total_us = std::max(shared_end_us, routed_end_us) -
+                    std::min(shared_start_us, routed_start_us);
+
+            MOE_CACHE_LOG("[moe-cache] dsv4%s layer=%d cache-miss shared=%.3f ms routed=%.3f ms overlapped=%.3f ms total=%.3f ms\n",
+                    mtp ? "-mtp" : "", layer,
+                    shared_us / 1000.0,
+                    routed_us / 1000.0,
+                    overlapped_us / 1000.0,
+                    total_us / 1000.0);
+        }
+        return;
+    }
+}
 
 // ---- API: stats ----------------------------------------------------------------------
 
@@ -2381,6 +2568,10 @@ void ggml_moe_cache_register(void) {
     ggml_moe_cache.glu_hits          = moe_cache_glu_hits;
     ggml_moe_cache.invalidate        = moe_cache_invalidate;
     ggml_moe_cache.node_time         = moe_cache_node_time;
+    ggml_moe_cache.overlap_shared_begin = moe_cache_overlap_shared_begin;
+    ggml_moe_cache.overlap_shared_end   = moe_cache_overlap_shared_end;
+    ggml_moe_cache.overlap_routed_begin = moe_cache_overlap_routed_begin;
+    ggml_moe_cache.overlap_routed_end   = moe_cache_overlap_routed_end;
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_REDIRECT")) g.redirect_on = atoi(e) > 0;
 
     MOE_CACHE_LOG("[moe-cache] enabled: n_dev=%d budget=%s inserts/plan=%d workers=%d stats_every=%d layer-quota=%d%%\n",

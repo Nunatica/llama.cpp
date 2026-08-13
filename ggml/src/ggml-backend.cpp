@@ -1612,11 +1612,35 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
+    static constexpr char overlap_shared_trunk[] = "dsv4_ffn_shexp_overlap-";
+    static constexpr char overlap_shared_mtp[]   = "dsv4_mtp_ffn_shexp_overlap-";
+    static constexpr char overlap_start_trunk[]  = "dsv4_ffn_moe_start_overlap-";
+    static constexpr char overlap_start_mtp[]    = "dsv4_mtp_ffn_moe_start_overlap-";
+    static constexpr char overlap_routed_trunk[] = "dsv4_ffn_moe_out_overlap-";
+    static constexpr char overlap_routed_mtp[]   = "dsv4_mtp_ffn_moe_out_overlap-";
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        const char * overlap_shared = nullptr;
+        const char * overlap_start = nullptr;
+        const char * overlap_routed = nullptr;
+        if (ggml_moe_cache.overlap_shared_begin || ggml_moe_cache.overlap_routed_begin || ggml_moe_cache.overlap_routed_end) {
+            for (int i = 0; i < split->graph.n_nodes; ++i) {
+                const char * name = split->graph.nodes[i]->name;
+                if (strncmp(name, overlap_shared_trunk, sizeof(overlap_shared_trunk) - 1) == 0 ||
+                    strncmp(name, overlap_shared_mtp, sizeof(overlap_shared_mtp) - 1) == 0) {
+                    overlap_shared = name;
+                } else if (strncmp(name, overlap_start_trunk, sizeof(overlap_start_trunk) - 1) == 0 ||
+                           strncmp(name, overlap_start_mtp, sizeof(overlap_start_mtp) - 1) == 0) {
+                    overlap_start = name;
+                } else if (strncmp(name, overlap_routed_trunk, sizeof(overlap_routed_trunk) - 1) == 0 ||
+                           strncmp(name, overlap_routed_mtp, sizeof(overlap_routed_mtp) - 1) == 0) {
+                    overlap_routed = name;
+                }
+            }
+        }
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1786,6 +1810,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        if (overlap_shared && ggml_moe_cache.overlap_shared_begin) {
+            ggml_moe_cache.overlap_shared_begin(split_backend, overlap_shared);
+        }
+        if (overlap_start && ggml_moe_cache.overlap_routed_begin) {
+            ggml_moe_cache.overlap_routed_begin(overlap_start, ggml_time_us());
+        }
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -1823,6 +1854,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 j0 = j1;
             }
+        }
+
+        if (overlap_shared && ggml_moe_cache.overlap_shared_end) {
+            ggml_moe_cache.overlap_shared_end(split_backend, overlap_shared);
+        }
+        if (overlap_routed && ggml_moe_cache.overlap_routed_end) {
+            ggml_moe_cache.overlap_routed_end(overlap_routed, ggml_time_us());
         }
 
         // record the event of this copy

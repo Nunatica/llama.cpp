@@ -84,6 +84,13 @@ struct ggml_moe_cache_api {
     // Node wall-time sample for the bail-out judge. code is begin()'s return
     // value: -3 = pure-CPU baseline sample, >= 0 = cache-engaged sample.
     void (*node_time)(int code, int64_t wall_us);
+
+    // The scheduler brackets the DeepSeek V4 shared GPU split and reports the routed CPU interval.
+    // The CUDA implementation logs timings only after a cache miss in the same layer.
+    void (*overlap_shared_begin)(void * backend, const char * tensor_name);
+    void (*overlap_shared_end)(void * backend, const char * tensor_name);
+    void (*overlap_routed_begin)(const char * tensor_name, int64_t start_us);
+    void (*overlap_routed_end)(const char * tensor_name, int64_t end_us);
 };
 
 // Zero-initialized in ggml-backend.cpp; populated by the CUDA backend in
