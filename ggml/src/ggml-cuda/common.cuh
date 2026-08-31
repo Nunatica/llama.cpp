@@ -770,6 +770,59 @@ static __device__ __forceinline__ void ggml_cuda_mad(float & acc, const half2 v,
 #endif // V_DOT2_F32_F16_AVAILABLE
 }
 
+#if defined(GGML_USE_HIP) && (defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || \
+    defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__) || defined(__gfx1153__) || defined(__gfx1200__) || defined(__gfx1201__))
+#define V_DOT2_F32_BF16_AVAILABLE
+#endif // defined(GGML_USE_HIP) && RDNA3/RDNA3.5/RDNA4 targets
+
+// Two BF16 products plus an FP32 add per instruction on RDNA3+; scalar FP32 math otherwise
+// (compile-only fallback: the native-BF16 path is never instantiated without the instruction).
+static __device__ __forceinline__ void ggml_cuda_mad(float & acc, const nv_bfloat162 v, const nv_bfloat162 u) {
+#ifdef V_DOT2_F32_BF16_AVAILABLE
+    asm volatile("v_dot2_f32_bf16 %0, %1, %2, %0" : "+v"(acc) : "v"(v), "v"(u));
+#else
+    const float2 tmpv = make_float2(__bfloat162float(__low2bfloat16(v)), __bfloat162float(__high2bfloat16(v)));
+    const float2 tmpu = make_float2(__bfloat162float(__low2bfloat16(u)), __bfloat162float(__high2bfloat16(u)));
+    acc += tmpv.x * tmpu.x;
+    acc += tmpv.y * tmpu.y;
+#endif // V_DOT2_F32_BF16_AVAILABLE
+}
+
+// Pack the low (ll) or high (hh) 16 bits of two nv_bfloat162 into one nv_bfloat162.
+// Used to pair BF16 values from two consecutive KV rows for v_dot2_f32_bf16 in the PV phase.
+// The %2, %1 operand order was verified on RDNA3 (gfx1100), RDNA3.5 (gfx1151), and RDNA4 (gfx120x).
+static __device__ __forceinline__ nv_bfloat162 ggml_cuda_bf16_perm_ll(const nv_bfloat162 v0, const nv_bfloat162 v1) {
+#ifdef V_DOT2_F32_BF16_AVAILABLE
+    nv_bfloat162 dst;
+    asm volatile("v_perm_b32 %0, %2, %1, 0x05040100" : "=v"(dst) : "v"(v0), "v"(v1));
+    return dst;
+#else
+    uint32_t a, b, r;
+    memcpy(&a, &v0, sizeof(a));
+    memcpy(&b, &v1, sizeof(b));
+    r = (a & 0xFFFF) | (b << 16);
+    nv_bfloat162 dst;
+    memcpy(&dst, &r, sizeof(r));
+    return dst;
+#endif // V_DOT2_F32_BF16_AVAILABLE
+}
+
+static __device__ __forceinline__ nv_bfloat162 ggml_cuda_bf16_perm_hh(const nv_bfloat162 v0, const nv_bfloat162 v1) {
+#ifdef V_DOT2_F32_BF16_AVAILABLE
+    nv_bfloat162 dst;
+    asm volatile("v_perm_b32 %0, %2, %1, 0x07060302" : "=v"(dst) : "v"(v0), "v"(v1));
+    return dst;
+#else
+    uint32_t a, b, r;
+    memcpy(&a, &v0, sizeof(a));
+    memcpy(&b, &v1, sizeof(b));
+    r = ((a >> 16) & 0xFFFF) | (b & 0xFFFF0000);
+    nv_bfloat162 dst;
+    memcpy(&dst, &r, sizeof(r));
+    return dst;
+#endif // V_DOT2_F32_BF16_AVAILABLE
+}
+
 static __device__ __forceinline__ void ggml_cuda_mad(half2 & acc, const half2 v, const half2 u) {
 #ifdef FAST_FP16_AVAILABLE
     acc += v*u;
@@ -1481,6 +1534,74 @@ struct ggml_backend_cuda_context {
         name(GGML_CUDA_NAME + std::to_string(device)) {
     }
 
+    // Per-graph cache of quantized Q8_1 matmul inputs.
+    // The decode mmvq launcher quantizes src1 to Q8_1 before every matmul.
+    // Matmuls sharing the same src1 data (e.g. the qkv/z/alpha/beta projections
+    // of one layer, or views of the same tensor) quantize it once and reuse the
+    // result. Entries are keyed by the view root of src1 (the tensor that owns
+    // the data) plus the data pointer and the quantize layout, so strided views
+    // never collide and stack-allocated per-expert slices of the mul_mat_id
+    // fallback (same tensor address, distinct data) never reuse each other's
+    // quantized tokens. The cache is valid only within one graph execution: a
+    // tensor is written once and its data is immutable until the next graph.
+    // Cleared at graph start; entries are also keyed by the stream they were
+    // quantized on, so forked streams never read unsynchronized data.
+    struct q8_1_cache_entry {
+        const ggml_tensor * src1 = nullptr;
+        const void * data = nullptr;
+        int stream_no = 0;
+        int64_t ne10 = 0;
+        int64_t ne11 = 0;
+        int64_t ne12 = 0;
+        int64_t ne13 = 0;
+        int64_t s11 = 0;
+        int64_t s12 = 0;
+        int64_t s13 = 0;
+        size_t offset = 0;
+        size_t size   = 0;
+    };
+    char * q8_1_arena = nullptr;
+    size_t q8_1_arena_size = 0;
+    std::vector<q8_1_cache_entry> q8_1_cache;
+    size_t q8_1_arena_pos = 0;
+
+    void q8_1_cache_clear() {
+        q8_1_cache.clear();
+        q8_1_arena_pos = 0;
+    }
+
+    // Returns the cached buffer for (src1, stream_no, layout) if present,
+    // otherwise allocates a new one from the arena and records it. The buffer
+    // is valid until the next q8_1_cache_clear().
+    void * q8_1_cache_get(const ggml_tensor * src1, int stream_no, size_t size,
+                          int64_t ne10, int64_t ne11, int64_t ne12, int64_t ne13,
+                          int64_t s11, int64_t s12, int64_t s13, bool & found) {
+        for (const auto & e : q8_1_cache) {
+            if (e.src1 == src1 && e.data == src1->data && e.stream_no == stream_no &&
+                e.ne10 == ne10 && e.ne11 == ne11 && e.ne12 == ne12 && e.ne13 == ne13 &&
+                e.s11 == s11 && e.s12 == s12 && e.s13 == s13) {
+                found = true;
+                return q8_1_arena + e.offset;
+            }
+        }
+        found = false;
+        if (q8_1_arena_pos + size > q8_1_arena_size) {
+            const size_t new_size = std::max(size_t(1) << 25, 2*(q8_1_arena_pos + size)); // 32 MiB min
+            char * new_arena = nullptr;
+            CUDA_CHECK(cudaMalloc(&new_arena, new_size));
+            if (q8_1_arena != nullptr) {
+                CUDA_CHECK(cudaMemcpy(new_arena, q8_1_arena, q8_1_arena_pos, cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaFree(q8_1_arena));
+            }
+            q8_1_arena = new_arena;
+            q8_1_arena_size = new_size;
+        }
+        void * data = q8_1_arena + q8_1_arena_pos;
+        q8_1_cache.push_back({ src1, src1->data, stream_no, ne10, ne11, ne12, ne13, s11, s12, s13, q8_1_arena_pos, size });
+        q8_1_arena_pos += size;
+        return data;
+    }
+
     ggml_cuda_stream_context concurrent_stream_context;
 
     ~ggml_backend_cuda_context();
@@ -1538,6 +1659,20 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gate_bias = nullptr;
     const ggml_tensor * x_scale = nullptr;
     const ggml_tensor * gate_scale = nullptr;
+    // when set (with glu_op == GGML_GLU_OP_NONE), the gate result is written
+    // to this separate destination instead of being combined into the main output
+    const ggml_tensor * dst_gate = nullptr;
+    // SSM conv-input fusion: the matmul output is the last row of an
+    // interleaved [conv_kernel_size, channels] conv input. The kernel writes
+    // conv_input[cs*c + cs-1] = result and copies the (cs-1) conv states rows
+    // from conv_states (a contiguous [(cs-1)*channels] GET_ROWS output) into
+    // conv_input[cs*c + k], k < cs-1. The separate CONCAT kernel is skipped.
+    const ggml_tensor * conv_input = nullptr;
+    const ggml_tensor * conv_states = nullptr;
+    int conv_kernel_size = 0;
+    // Index x_scale by the destination channel (token), not the source channel
+    // (expert). Used for the MoE down x topk-weights fusion.
+    bool x_scale_channel_dst = false;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
 };
@@ -1547,6 +1682,11 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate_bias = nullptr;
     const void * x_scale = nullptr;
     const void * gate_scale = nullptr;
+    const void * dst_gate = nullptr;
+    const void * conv_input = nullptr;
+    const void * conv_states = nullptr;
+    int conv_kernel_size = 0;
+    bool x_scale_channel_dst = false;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
 };
