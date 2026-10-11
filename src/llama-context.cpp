@@ -87,7 +87,9 @@ llama_context::llama_context(
     model(model),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
-    balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
+    // MTP uses the embd input for the hidden state
+    balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd(),
+                llm_arch_supports_mixed_batch(model.arch) && params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT)) {
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
@@ -1229,6 +1231,11 @@ void llama_context::set_embeddings(bool value) {
 
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
+
+    if (cparams.embeddings_nextn != value || cparams.embeddings_nextn_masked != masked) {
+        // these flags change the graph shape
+        sched_need_reserve = true;
+    }
 
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
@@ -2406,6 +2413,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_BAILINGMOE3 ||
         model.arch == LLM_ARCH_QWEN35 ||
         model.arch == LLM_ARCH_QWEN35MOE ||
+        model.arch == LLM_ARCH_CLEF ||
         model.arch == LLM_ARCH_QWEN4EXP ||
         model.arch == LLM_ARCH_DEEPSEEK4 ||
         (model.arch == LLM_ARCH_DFLASH && model.hparams.dsv4_hc_mult > 0) ||
@@ -2425,23 +2433,9 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         }
     }
 
-    uint32_t n_sampling_nodes = 0;
-    uint32_t n_sampling_nodes_max = 0;
+    // every sampler builds n_outputs_max_per_seq chains, see llm_graph_context::build_sampling
     for (const auto & [seq_id, sampler] : sampling.samplers) {
-        const uint32_t n_nodes = llama_sampler_backend_n_nodes(sampler);
-        n_sampling_nodes += n_nodes;
-        if (cparams.n_outputs_max_per_seq > 1) {
-            n_sampling_nodes_max = std::max(n_sampling_nodes_max, n_nodes);
-        }
-    }
-
-    const uint32_t n_sampling_outputs_max = std::min<uint64_t>(
-            std::min(n_tokens, cparams.n_outputs_max),
-            (uint64_t) cparams.n_seq_max * cparams.n_outputs_max_per_seq);
-
-    res += n_sampling_nodes;
-    if (n_sampling_outputs_max > 1) {
-        res += (n_sampling_outputs_max - 1) * n_sampling_nodes_max;
+        res += llama_sampler_backend_n_nodes(sampler) * cparams.n_outputs_max_per_seq;
     }
 
     if (cparams.training) {

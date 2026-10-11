@@ -195,6 +195,8 @@ cmake -B build -DGGML_CUDA=ON
 cmake --build build --config Release
 ```
 
+To use a specific CCCL version instead of the one bundled with the installed CUDA Toolkit, add `-DGGML_CUDA_CCCL_VERSION=vMAJOR.MINOR.PATCH`. CUB DeviceTopK requires CCCL 3.4.3 or newer; older versions use the sort fallback.
+
 Note that this also builds the CPU backend by default. On Windows on ARM, MSVC's
 support for the ARM NEON intrinsics used by the CPU backend may be incomplete, so
 a CUDA build produced entirely with MSVC might have a slower CPU backend. If CPU
@@ -349,7 +351,7 @@ cmake --build build --config Release
 
 #### Override Compute Capability Specifications
 
-By default, all supported compute capabilities are enabled. To customize this behavior, you can specify the `MUSA_ARCHITECTURES` option in the CMake command:
+By default, compute capabilities `2.2` (MTT S4000) and `3.1` (MTT S5000) are enabled, compute capability `2.1` (MTT S70, MTT S80, MTT S3000) is deprecated and has to be enabled explicitly. To customize this behavior, you can specify the `MUSA_ARCHITECTURES` option in the CMake command:
 
 ```bash
 cmake -B build -DGGML_MUSA=ON -DMUSA_ARCHITECTURES="31"
