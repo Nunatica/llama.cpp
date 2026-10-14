@@ -432,7 +432,7 @@ If your GPU is not officially supported you can use the environment variable [`H
 The CUDA and HIP backends cache supported CPU expert weights in VRAM when `GGML_CUDA_MOE_CACHE` is enabled (the default). Use `--cpu-moe` to keep expert weights in host memory when testing this path.
 
 - `GGML_CUDA_MOE_CACHE_BUDGET_MB`: maximum cache allocation per device in MiB, including cache scratch buffers. `0` uses available VRAM after the reserve.
-- `GGML_CUDA_MOE_CACHE_RESERVE_MB`: target free VRAM per device in MiB (default: `3072`). The cache leaves approximately this amount free, subject to slot granularity, small memory changes, and allocations by other processes.
+- `GGML_CUDA_MOE_CACHE_RESERVE_MB`: target free VRAM per device in MiB (default: `512`). The cache leaves approximately this amount free, subject to slot granularity, small memory changes, and allocations by other processes.
 
 After model, context, and KV allocation, the cache measures available VRAM. Loading a draft model or MTP context releases the cache first and recalculates its budget afterward. Small decode batches (up to 32 tokens, or the number of parallel sequences if larger) use a smaller compute workspace; larger batches restore the prefill workspace. Batch limits reported by the context remain unchanged. Cache use during expert computation still follows `GGML_CUDA_MOE_CACHE_MAX_BATCH`.
 

@@ -193,7 +193,7 @@ struct moe_cache_global {
     bool   enabled  = false;
     int    n_dev    = 0;
     size_t budget_mb = 0;        // 0 = auto (free VRAM minus reserve)
-    size_t reserve_mb = 3072;    // VRAM left untouched per device: the CUDA pool
+    size_t reserve_mb = 512;     // VRAM left untouched per device: the CUDA pool
                                  // grows lazily AFTER our init; stealing it
                                  // crashes the model mid-decode (measured)
     int    inserts_per_plan = 8; // max inserts enqueued per plan() call
