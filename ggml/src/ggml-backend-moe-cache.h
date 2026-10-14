@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ggml.h"
+
 #include <stdint.h>
 #include <stddef.h>
 
@@ -88,7 +90,7 @@ struct ggml_moe_cache_api {
 
 // Zero-initialized in ggml-backend.cpp; populated by the CUDA backend in
 // ggml_backend_cuda_reg() when the cache is enabled (GGML_CUDA_MOE_CACHE=1).
-extern struct ggml_moe_cache_api ggml_moe_cache;
+GGML_API struct ggml_moe_cache_api ggml_moe_cache;
 
 #ifdef __cplusplus
 }
