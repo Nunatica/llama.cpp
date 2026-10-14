@@ -27,6 +27,7 @@
 #include "../ggml-backend-moe-cache.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -106,7 +107,7 @@ struct moe_cache_pool {
 struct moe_cache_device {
     moe_cache_pool pools[MOE_CACHE_MAX_POOLS];
     int      n_pools = 0;
-    bool     dead    = false;   // CUDA failure or trim: cache permanently off here
+    bool     dead    = false;   // CUDA failure: cache permanently off here
 
     cudaStream_t compute_stream = nullptr;
 
@@ -124,6 +125,11 @@ struct moe_cache_device {
     float   * d_out = nullptr;                              size_t d_out_cap = 0;
     float   * h_out = nullptr;                              size_t h_out_cap = 0; // pinned
     int       out_rows = 0;
+    size_t    scratch_limit = 0;
+    size_t    scratch_n_in = 0;
+    size_t    scratch_n_out = 0;
+    size_t    reclaim_runtime_free = 0;
+    size_t    reclaim_physical_free = 0;
 
     // activation reuse: gate and up of one layer share the same input row
     const float * q8_act_ptr = nullptr;   // host act already quantized on device
@@ -177,18 +183,24 @@ struct moe_cache_job {
     int        eid = -1;
 };
 
+struct moe_cache_request_stats {
+    int64_t id = -1;
+    long long hits[MOE_CACHE_MAX_DEV] = {};
+    long long misses[MOE_CACHE_MAX_DEV] = {};
+};
+
 struct moe_cache_global {
     bool   enabled  = false;
     int    n_dev    = 0;
-    size_t budget_mb = 0;        // 0 = auto (free VRAM at init minus reserve)
+    size_t budget_mb = 0;        // 0 = auto (free VRAM minus reserve)
     size_t reserve_mb = 3072;    // VRAM left untouched per device: the CUDA pool
                                  // grows lazily AFTER our init; stealing it
                                  // crashes the model mid-decode (measured)
     int    inserts_per_plan = 8; // max inserts enqueued per plan() call
     int    queue_max        = 512;
     int    n_workers        = 4;
-    size_t min_expert_bytes = 1u << 18; // skip models whose experts are too small (default: 256 KiB)
-    int    max_batch        = 3; // decode batches up to this size use the cache
+    size_t min_expert_bytes = 1u << 16; // skip models whose experts are too small (default: 64 KiB)
+    int    max_batch        = 8; // decode batches up to this size use the cache
                                  // (GGML_CUDA_MOE_CACHE_MAX_BATCH; >1 for spec-verify/parallel)
     int    stats_every      = 0; // log every N collect() calls (0 = off)
     int    layer_quota_pct  = 25; // pool share reserved as equal per-layer floors (GGML_CUDA_MOE_CACHE_LAYER_QUOTA_PCT)
@@ -215,6 +227,7 @@ struct moe_cache_global {
     const void *            inflight_src_gate[16] = {};
     size_t                  inflight_len[16] = {};
     bool                    workers_started = false;
+    bool                    resizing = false;
 
     // current node context (begin..collect happen on one thread)
     uint64_t     cur_key_base = 0;
@@ -239,6 +252,8 @@ struct moe_cache_global {
     // under mu at job-pull time; plain arrays, blk-indexed)
     int8_t       blk_pair_pool[1024];    // paired-pool index on the owning dev, -1 unknown
     int8_t       blk_down_pool[1024];    // down-pool index, -1 unknown
+    size_t       blk_role_size[3][1024] = {};
+    int          blk_role_type[3][1024] = {};
     int          blk_n_expert[1024] = {};
     uint64_t     blk_down_kb[1024] = {}; // down key base (name-hash ^ ptr-hash)
     const void * blk_down_base[1024] = {};
@@ -283,6 +298,10 @@ struct moe_cache_global {
     bool redirect_on = true;       // GGML_CUDA_MOE_CACHE_REDIRECT=0 to disable
 
     long long collect_calls = 0;
+    std::unordered_map<int32_t, moe_cache_request_stats> requests;
+    std::vector<std::vector<int32_t>> request_seqs;
+    moe_cache_request_stats last_request;
+    bool last_request_pending = false;
 
     // ---- baseline-sampled bail-out ----
     // Phase A (after pools build): eligible nodes run pure-CPU while their wall
@@ -717,7 +736,11 @@ static void moe_cache_worker_main(int wid) {
         moe_cache_job job;
         {
             std::unique_lock<std::mutex> lk(g.mu);
-            while (g.queue.empty()) {
+            while (g.resizing || g.queue.empty()) {
+                if (g.resizing) {
+                    g.cv.wait(lk);
+                    continue;
+                }
                 if (g.backfill.enabled && g.backfill.active && !g.backfill.done && moe_cache_backfill_next(job)) {
                     goto have_job;
                 }
@@ -816,17 +839,13 @@ static void moe_cache_start_workers() {
 
 // ---- init ---------------------------------------------------------------------
 
-// Shape discovery. Pools are created per device ON DEMAND once any tensor name
-// has repeated globally (i.e. the steady decode loop has begun — allocating on
-// the very first sighting would mis-budget before the model placement and KV
-// allocations settle). There is no "warmup complete" latch: a shape first seen
-// late (odd per-layer quants, partial GPU placement, bench context churn)
-// simply gets its pool late. No visit order can lock a device out.
+// Register the host tensor census before inference, or discover it on CPU expert visits.
 struct moe_cache_discovery {
     std::unordered_set<uint64_t> seen;
     struct shape { size_t size; int wtype; int n_tensors; int roles; int64_t n_expert; };
-    std::vector<shape> pending[MOE_CACHE_MAX_DEV];   // shapes seen, pool not yet built
+    std::vector<shape> shapes[MOE_CACHE_MAX_DEV];
     bool any_repeat = false;
+    bool registered = false;
     // stable-census guard: pools are built only after the shape census has not
     // changed for a window of eligible visits AND a tensor has repeated. A
     // partially-discovered census mis-sizes pools permanently (measured: the
@@ -847,7 +866,7 @@ static bool moe_cache_pool_alloc(int di, size_t expert_size, int wtype, size_t b
     // parallel slabs: same byte budget, half the slot count, same number of
     // cached EXPERTS per byte as two independent entries — but joint by
     // construction, which the fused kernel requires
-    int ns = (int)(budget / (paired ? 2 * expert_size : expert_size));
+    int ns = (int)std::min<size_t>(budget / (paired ? 2 * expert_size : expert_size), INT32_MAX);
     // cap slots at the number of distinct cacheable entries (safe now: pools
     // are only built after the stable-census window, so n_tensors is real)
     if (max_entries > 0 && ns > max_entries) ns = (int)max_entries;
@@ -917,7 +936,239 @@ static bool moe_cache_pool_alloc(int di, size_t expert_size, int wtype, size_t b
     return true;
 }
 
+static void moe_cache_hotset_load(int64_t n_expert, size_t expert_size) {
+    if (g.hotset_enabled && !g.hotset_path[0]) {
+        // fingerprint: model-distinguishing facts known at this point
+        const char * base = getenv("HOME");           // POSIX
+        if (!base) base = getenv("LOCALAPPDATA");     // Windows
+        if (!base) {
+            g.hotset_enabled = false;                 // no cache dir: skip persistence
+        } else {
+            snprintf(g.hotset_path, sizeof(g.hotset_path),
+                     "%s/.cache/llama.cpp/moe-cache-hotset-%lldx%dx%zu-d%d.bin",
+                     base, (long long)n_expert, 1,
+                     expert_size, g.n_dev);
+            FILE * f = fopen(g.hotset_path, "rb");
+            if (f) {
+                const bool ok = fread(g.hot_pair, 1, sizeof(g.hot_pair), f) == sizeof(g.hot_pair)
+                             && fread(g.hot_down, 1, sizeof(g.hot_down), f) == sizeof(g.hot_down);
+                fclose(f);
+                if (ok) {
+                    g.hot_loaded = true;
+                    long bits = 0;
+                    for (int b2 = 0; b2 < 1024; b2++)
+                        for (int w2 = 0; w2 < 4; w2++)
+                            bits += __builtin_popcountll(g.hot_pair[b2][w2]);
+                    MOE_CACHE_LOG("[moe-cache] hot-set prior loaded: %ld pair entries - backfill starts warm\n", bits);
+                }
+            }
+        }
+    }
+}
+
+static size_t moe_cache_free_memory() {
+    size_t free_mem = 0, total_mem = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
+#if defined(GGML_USE_HIP) && defined(__linux__)
+    // HIP can include VRAM occupied by the display driver in its free count.
+    char pci[32] = {};
+    if (cudaDeviceGetPCIBusId(pci, sizeof(pci), ggml_cuda_get_device()) == cudaSuccess) {
+        char path[128];
+        unsigned long long total = 0, used = 0;
+        snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/mem_info_vram_total", pci);
+        FILE * file = fopen(path, "r");
+        const bool have_total = file && fscanf(file, "%llu", &total) == 1;
+        if (file) fclose(file);
+        snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/mem_info_vram_used", pci);
+        file = fopen(path, "r");
+        const bool have_used = file && fscanf(file, "%llu", &used) == 1;
+        if (file) fclose(file);
+        if (have_total && have_used && used <= total) free_mem = std::min(free_mem, (size_t)(total - used));
+    } else {
+        (void)cudaGetLastError();
+    }
+#endif
+    return free_mem;
+}
+
+static void moe_cache_settle_memory(moe_cache_device & d) {
+#if defined(GGML_USE_HIP) && defined(__linux__)
+    size_t runtime_free = 0, total = 0;
+    CUDA_CHECK(cudaMemGetInfo(&runtime_free, &total));
+    constexpr size_t tolerance = 64u << 20;
+    if (d.reclaim_runtime_free && runtime_free > d.reclaim_runtime_free + tolerance) {
+        const size_t expected = d.reclaim_physical_free + runtime_free - d.reclaim_runtime_free - tolerance;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+        while (moe_cache_free_memory() < expected && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    }
+#else
+    GGML_UNUSED(d);
+#endif
+    d.reclaim_runtime_free = 0;
+    d.reclaim_physical_free = 0;
+}
+
+static size_t moe_cache_device_bytes(const moe_cache_device & d) {
+    size_t bytes = 0;
+    for (int pi = 0; pi < d.n_pools; ++pi) {
+        const auto & p = d.pools[pi];
+        bytes += (size_t)p.n_slots * p.expert_size * (p.paired ? 2 : 1);
+    }
+    return bytes;
+}
+
+static size_t moe_cache_scratch_bytes(const moe_cache_device & d) {
+    const size_t current = d.ids_cap * sizeof(int32_t) + d.act_cap + d.act_q8_cap + d.d_out_cap;
+    return std::max(d.scratch_limit, current);
+}
+
+static size_t moe_cache_target_bytes(size_t free_mem, size_t current, size_t scratch) {
+    const size_t available = free_mem + current;
+    const size_t reserve = g.reserve_mb << 20;
+    size_t target = available > reserve ? available - reserve : 0;
+    if (g.budget_mb) {
+        const size_t budget = g.budget_mb << 20;
+        target = std::min(target, budget > scratch ? budget - scratch : 0);
+    }
+    return target;
+}
+
+static void moe_cache_build_pools(int di, size_t avail) {
+    moe_cache_device & d = g.dev[di];
+    auto & pend = g_disc.shapes[di];
+    if (!pend.empty()) {
+        // Role-group budgeting. Mixed-quant models (UD-*_XL) fragment one
+        // role into many (size, type) shapes; naive per-shape weighting
+        // hands each fragment a sliver below the slot floor and the whole
+        // role dies (measured: every down projection ran CPU-only on a
+        // 24 GB device while gate/up hit 77%). Budget by role group first,
+        // then allocate within the group largest-first, folding the share
+        // of dead fragments into the survivors.
+        auto shape_w = [](const moe_cache_discovery::shape & sh) {
+            return (double)sh.size * (sh.n_tensors > 0 ? sh.n_tensors : 1);
+        };
+        auto is_paired_sh = [&](const moe_cache_discovery::shape & sh) {
+            return g.fuse && (sh.roles & 0b11) == 0b11;
+        };
+        double w_pair = 0.0, w_rest = 0.0;
+        for (auto & sh : pend) {
+            (is_paired_sh(sh) ? w_pair : w_rest) += shape_w(sh);
+        }
+        const double w_all = w_pair + w_rest;
+        std::vector<const moe_cache_discovery::shape *> order;
+        for (auto & sh : pend) order.push_back(&sh);
+        std::sort(order.begin(), order.end(),
+                  [&](const moe_cache_discovery::shape * a, const moe_cache_discovery::shape * b) {
+                      return shape_w(*a) > shape_w(*b);
+                  });
+        size_t group_left[2] = {                       // [0]=paired, [1]=rest
+            w_all > 0 ? (size_t)(avail * (w_pair / w_all)) : 0,
+            w_all > 0 ? (size_t)(avail * (w_rest / w_all)) : 0,
+        };
+        double group_w_left[2] = { w_pair, w_rest };
+        for (const auto * shp_p : order) {
+            const auto & sh = *shp_p;
+            const bool paired = is_paired_sh(sh);
+            const int  gidx   = paired ? 0 : 1;
+            if (group_w_left[gidx] <= 0.0) continue;
+            size_t budget = (size_t)(group_left[gidx] * (shape_w(sh) / group_w_left[gidx]));
+            const int64_t max_entries = (paired ? sh.n_tensors / 2 : sh.n_tensors) * (int64_t)sh.n_expert;
+            const size_t need = (size_t)max_entries * sh.size * (paired ? 2 : 1);
+            if (budget > need) budget = need;          // never strand bytes in caps
+            const size_t free_mem = moe_cache_free_memory();
+            const size_t reserve = g.reserve_mb << 20;
+            budget = std::min(budget, free_mem > reserve ? free_mem - reserve : 0);
+            const int pi = d.n_pools;
+            if (moe_cache_pool_alloc(di, sh.size, sh.wtype, budget, paired, max_entries)) {
+                const auto & pool = d.pools[pi];
+                group_left[gidx] -= (size_t)pool.n_slots * pool.expert_size * (pool.paired ? 2 : 1);
+            }
+            // dead fragments consume nothing: their share flows to the
+            // next shapes of the same group automatically
+            group_w_left[gidx] -= shape_w(sh);
+        }
+    }
+}
+
+static void moe_cache_rebudget(const char * phase);
+
 // ---- API: begin -----------------------------------------------------------------
+
+static bool moe_cache_supported_type(int wtype) {
+    switch ((ggml_type)wtype) {
+        case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1: case GGML_TYPE_Q8_0: case GGML_TYPE_MXFP4:
+        case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K: case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S:  case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:   case GGML_TYPE_IQ4_NL: case GGML_TYPE_IQ4_XS:
+            break;
+        default:
+            return false;
+    }
+
+    return true;
+}
+
+static bool moe_cache_register_tensor(const ggml_tensor * tensor) {
+    if (!g.enabled || !tensor->data || !tensor->buffer || !ggml_backend_buffer_is_host(tensor->buffer) ||
+        tensor->nb[2] < g.min_expert_bytes || tensor->ne[0] <= 0 || tensor->ne[1] <= 0 ||
+        tensor->ne[0] > INT32_MAX || tensor->ne[1] > INT32_MAX || tensor->ne[2] < 1 ||
+        tensor->ne[2] > INT32_MAX || !moe_cache_supported_type(tensor->type)) {
+        return false;
+    }
+    const char * name = tensor->name;
+    const char * block = strstr(name, "blk.");
+    if (!block || !strstr(name, "_exps")) return false;
+    const int blk = atoi(block + 4);
+    if (blk < 0 || blk >= 1024) return false;
+    int role = -1;
+    if      (strstr(name, "_gate_exps")) role = 0;
+    else if (strstr(name, "_up_exps"))   role = 1;
+    else if (strstr(name, "_down_exps")) role = 2;
+    if (role < 0) return false;
+    const int di = blk % g.n_dev;
+    std::lock_guard<std::mutex> lock(g.mu);
+    const uint64_t key = moe_cache_fnv1a(name);
+    if (g_disc.seen.insert(key).second) {
+        auto & shapes = g_disc.shapes[di];
+        auto it = std::find_if(shapes.begin(), shapes.end(), [&](const moe_cache_discovery::shape & sh) {
+            return sh.size == tensor->nb[2] && sh.wtype == tensor->type;
+        });
+        if (it == shapes.end()) {
+            shapes.push_back({tensor->nb[2], tensor->type, 0, 0, tensor->ne[2]});
+            it = shapes.end() - 1;
+        }
+        ++it->n_tensors;
+        if (role >= 0) it->roles |= 1 << role;
+    }
+    auto & d = g.dev[di];
+    d.scratch_n_in = std::max(d.scratch_n_in, (size_t)tensor->ne[0]);
+    d.scratch_n_out = std::max(d.scratch_n_out, (size_t)tensor->ne[1]);
+    const size_t n_in = d.scratch_n_in;
+    const size_t n_out = d.scratch_n_out;
+    const size_t n_padded = GGML_PAD(n_in, MATRIX_ROW_PADDING);
+    const size_t scratch = (64 * 2 + 8) * sizeof(int32_t) + 2 * 64 * n_in * sizeof(float) +
+        2 * 64 * (n_padded / QK8_1) * sizeof(block_q8_1) + 2 * 128 * n_out * sizeof(float) + 65536;
+    d.scratch_limit = scratch;
+    g.blk_n_expert[blk] = (int)tensor->ne[2];
+    if (role >= 0) {
+        g.blk_role_size[role][blk] = tensor->nb[2];
+        g.blk_role_type[role][blk] = tensor->type;
+    }
+    if (role == 0 || role == 1) {
+        g.role_base[role][blk] = tensor->data;
+    } else if (role == 2) {
+        g.blk_down_base[blk] = tensor->data;
+        g.blk_down_kb[blk] = key ^ moe_cache_ptr_hash(tensor->data);
+    }
+    g_disc.any_repeat = true;
+    g_disc.registered = true;
+    return true;
+}
 
 static int moe_cache_begin(const char * name, const void * host_base, size_t expert_size,
                      int64_t n_in, int64_t n_out, int wtype, int64_t n_expert, int64_t n_tokens) {
@@ -952,20 +1203,7 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
         }
     }
 
-    // only types with a kernel case in mul_mat_vec_q_switch_type — anything else
-    // would GGML_ABORT on the first cached row (e.g. F16/BF16/TQ expert tensors)
-    switch ((ggml_type)wtype) {
-        case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_0:
-        case GGML_TYPE_Q5_1: case GGML_TYPE_Q8_0: case GGML_TYPE_MXFP4:
-        case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K: case GGML_TYPE_Q4_K:
-        case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K:
-        case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S:
-        case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S:  case GGML_TYPE_IQ1_S:
-        case GGML_TYPE_IQ1_M:   case GGML_TYPE_IQ4_NL: case GGML_TYPE_IQ4_XS:
-            break;
-        default:
-            return -1;
-    }
+    if (!moe_cache_supported_type(wtype)) return -1;
 
     const char * p = strstr(name, "blk.");
     if (!p || !strstr(name, "_exps")) return -1;
@@ -981,6 +1219,10 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
     const uint64_t kb = moe_cache_fnv1a(name);
     moe_cache_device & d = g.dev[di];
     if (d.dead) return -1;
+    if (g_disc.registered && role >= 0 && blk >= 0 && blk < 1024) {
+        const void * source = role == 2 ? g.blk_down_base[blk] : g.role_base[role][blk];
+        if (source != host_base) return -1;
+    }
     const bool first_sight = g_disc.seen.count(kb) == 0;
 
     // shape discovery + on-demand pool construction (see moe_cache_discovery)
@@ -988,14 +1230,14 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
     for (int i = 0; i < d.n_pools; i++) {
         if (d.pools[i].expert_size == expert_size && d.pools[i].wtype == wtype) { pi = i; break; }
     }
-    if (pi < 0) {
+    if (pi < 0 && !g_disc.registered) {
         moe_cache_discovery::shape * shp = nullptr;
-        for (auto & sh : g_disc.pending[di]) {
+        for (auto & sh : g_disc.shapes[di]) {
             if (sh.size == expert_size && sh.wtype == wtype) { shp = &sh; break; }
         }
         if (!shp) {
-            g_disc.pending[di].push_back({expert_size, wtype, 0, 0, n_expert});
-            shp = &g_disc.pending[di].back();
+            g_disc.shapes[di].push_back({expert_size, wtype, 0, 0, n_expert});
+            shp = &g_disc.shapes[di].back();
             g_disc.stable_count = 0;   // census changed: restart the stability window
             MOE_CACHE_DBG("[moe-cache-dbg] new shape %s blk=%d dev=%d size=%zu type=%d\n",
                     name, blk, di, expert_size, wtype);
@@ -1016,107 +1258,13 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
         if (g_disc.stable_count < 64) {
             return -1;
         }
-        static bool announced = false;
-        if (!announced) {
-            announced = true;
-            MOE_CACHE_LOG("[moe-cache] decode loop detected, shape census stable — building pools\n");
-            if (g.hotset_enabled && !g.hotset_path[0]) {
-                // fingerprint: model-distinguishing facts known at this point
-                const char * base = getenv("HOME");           // POSIX
-                if (!base) base = getenv("LOCALAPPDATA");     // Windows
-                if (!base) {
-                    g.hotset_enabled = false;                 // no cache dir: skip persistence
-                } else {
-                    snprintf(g.hotset_path, sizeof(g.hotset_path),
-                             "%s/.cache/llama.cpp/moe-cache-hotset-%lldx%dx%zu-d%d.bin",
-                             base, (long long)n_expert, blk >= 0 ? 1 : 0,
-                             expert_size, g.n_dev);
-                    FILE * f = fopen(g.hotset_path, "rb");
-                    if (f) {
-                        const bool ok = fread(g.hot_pair, 1, sizeof(g.hot_pair), f) == sizeof(g.hot_pair)
-                                     && fread(g.hot_down, 1, sizeof(g.hot_down), f) == sizeof(g.hot_down);
-                        fclose(f);
-                        if (ok) {
-                            g.hot_loaded = true;
-                            long bits = 0;
-                            for (int b2 = 0; b2 < 1024; b2++)
-                                for (int w2 = 0; w2 < 4; w2++)
-                                    bits += __builtin_popcountll(g.hot_pair[b2][w2]);
-                            MOE_CACHE_LOG("[moe-cache] hot-set prior loaded: %ld pair entries — backfill starts warm\n", bits);
-                        }
-                    }
-                }
-            }
-        }
-        // steady state reached: build this device's pending pools in ONE
-        // proportional pass. Budgets are weighted by referenced bytes per
-        // token (shape size x number of tensors using the shape — gate+up
-        // share a shape, so theirs weighs ~2x per layer vs down's 1x); the
-        // previous sequential-halving scheme left ~25% of the budget
-        // unallocated and starved the down pool (measured).
-        auto & pend = g_disc.pending[di];
-        if (!pend.empty()) {
-            const size_t reserve = g.reserve_mb << 20;
-            size_t free_mem = 0, total_mem = 0;
-            ggml_cuda_set_device(di);
-            CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
-            size_t avail = free_mem > reserve ? free_mem - reserve : 0;
-            if (g.budget_mb > 0 && (g.budget_mb << 20) < avail) {
-                avail = g.budget_mb << 20;
-            }
-            // Role-group budgeting. Mixed-quant models (UD-*_XL) fragment one
-            // role into many (size, type) shapes; naive per-shape weighting
-            // hands each fragment a sliver below the slot floor and the whole
-            // role dies (measured: every down projection ran CPU-only on a
-            // 24 GB device while gate/up hit 77%). Budget by role group first,
-            // then allocate within the group largest-first, folding the share
-            // of dead fragments into the survivors.
-            auto shape_w = [](const moe_cache_discovery::shape & sh) {
-                return (double)sh.size * (sh.n_tensors > 0 ? sh.n_tensors : 1);
-            };
-            auto is_paired_sh = [&](const moe_cache_discovery::shape & sh) {
-                return g.fuse && (sh.roles & 0b11) == 0b11;
-            };
-            double w_pair = 0.0, w_rest = 0.0;
-            for (auto & sh : pend) {
-                (is_paired_sh(sh) ? w_pair : w_rest) += shape_w(sh);
-            }
-            const double w_all = w_pair + w_rest;
-            std::vector<const moe_cache_discovery::shape *> order;
-            for (auto & sh : pend) order.push_back(&sh);
-            std::sort(order.begin(), order.end(),
-                      [&](const moe_cache_discovery::shape * a, const moe_cache_discovery::shape * b) {
-                          return shape_w(*a) > shape_w(*b);
-                      });
-            size_t group_left[2] = {                       // [0]=paired, [1]=rest
-                w_all > 0 ? (size_t)(avail * (w_pair / w_all)) : 0,
-                w_all > 0 ? (size_t)(avail * (w_rest / w_all)) : 0,
-            };
-            double group_w_left[2] = { w_pair, w_rest };
-            for (const auto * shp_p : order) {
-                const auto & sh = *shp_p;
-                const bool paired = is_paired_sh(sh);
-                const int  gidx   = paired ? 0 : 1;
-                if (group_w_left[gidx] <= 0.0) continue;
-                size_t budget = (size_t)(group_left[gidx] * (shape_w(sh) / group_w_left[gidx]));
-                const int64_t max_entries = (paired ? sh.n_tensors / 2 : sh.n_tensors) * (int64_t)sh.n_expert;
-                const size_t need = (size_t)max_entries * sh.size * (paired ? 2 : 1);
-                if (budget > need) budget = need;          // never strand bytes in caps
-                const size_t before = budget;
-                if (moe_cache_pool_alloc(di, sh.size, sh.wtype, budget, paired, max_entries)) {
-                    group_left[gidx] -= before;            // consumed (approx; slack folds forward)
-                }
-                // dead fragments consume nothing: their share flows to the
-                // next shapes of the same group automatically
-                group_w_left[gidx] -= shape_w(sh);
-            }
-        }
-        pend.clear();
+        moe_cache_rebudget("discovery");
         for (int i = 0; i < d.n_pools; i++) {
             if (d.pools[i].expert_size == expert_size && d.pools[i].wtype == wtype) { pi = i; break; }
         }
         if (pi < 0) return -1;
     }
+    if (pi < 0) return -1;
     if (d.pools[pi].slab == nullptr) return -1;   // dead marker (alloc failed)
     if (!g_disc.any_repeat) {
         if (g_disc.seen.count(kb)) {
@@ -1189,6 +1337,90 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
     return di;
 }
 
+static void moe_cache_request_begin(int32_t seq_id, int64_t request_id) {
+    std::lock_guard<std::mutex> lock(g.mu);
+    auto & stats = g.requests[seq_id];
+    stats = moe_cache_request_stats{};
+    stats.id = request_id;
+}
+
+static void moe_cache_request_batch(uint32_t n_tokens, const int32_t * n_seq_id, int32_t * const * seq_id) {
+    std::lock_guard<std::mutex> lock(g.mu);
+    g.request_seqs.clear();
+    if (g.requests.empty()) return;
+    g.request_seqs.resize(n_tokens);
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        for (int32_t j = 0; j < n_seq_id[i]; ++j) {
+            if (g.requests.count(seq_id[i][j])) g.request_seqs[i].push_back(seq_id[i][j]);
+        }
+    }
+}
+
+// g.mu is held; k indexes the token-major expert ids used by plan().
+static void moe_cache_request_record(int di, int k, int n_ids, bool hit) {
+    if (n_ids <= 0 || k < 0 || k >= n_ids || g.cur_n_tokens <= 0 || g.request_seqs.size() != (size_t)g.cur_n_tokens || n_ids % g.cur_n_tokens) return;
+    const size_t token = k / (n_ids / g.cur_n_tokens);
+    for (int32_t seq_id : g.request_seqs[token]) {
+        auto it = g.requests.find(seq_id);
+        if (it != g.requests.end()) (hit ? it->second.hits[di] : it->second.misses[di])++;
+    }
+}
+
+static void moe_cache_request_residency(const moe_cache_device & d, int di, size_t & cached, size_t & total) {
+    uint8_t required[1024] = {};
+    cached = total = 0;
+    for (int blk = di; blk < 1024; blk += g.n_dev) {
+        required[blk] = (g.role_base[0][blk] ? 1 : 0) | (g.role_base[1][blk] ? 2 : 0) | (g.blk_down_base[blk] ? 4 : 0);
+        if (required[blk]) total += g.blk_n_expert[blk];
+    }
+    std::unordered_map<uint64_t, uint8_t> resident;
+    for (int pi = 0; pi < d.n_pools; ++pi) {
+        const auto & p = d.pools[pi];
+        for (int si = 0; si < p.n_used; ++si) {
+            const auto & slot = p.slots[si];
+            const int blk = slot.blk;
+            if (!slot.valid || blk < 0 || blk >= 1024 || slot.eid < 0 || slot.eid >= g.blk_n_expert[blk]) continue;
+            uint8_t roles = 0;
+            for (int role = 0; role < 3; ++role) {
+                const void * base = role == 2 ? g.blk_down_base[blk] : g.role_base[role][blk];
+                if (!base) continue;
+                const void * source = (const char *)base + (size_t)slot.eid * g.blk_role_size[role][blk];
+                if (slot.src == source || slot.src_gate == source) roles |= 1 << role;
+            }
+            resident[((uint64_t)blk << 32) | (uint32_t)slot.eid] |= roles;
+        }
+    }
+    for (const auto & entry : resident) {
+        const uint8_t mask = required[entry.first >> 32];
+        cached += mask && (entry.second & mask) == mask;
+    }
+}
+
+static void moe_cache_request_end(int32_t seq_id) {
+    std::lock_guard<std::mutex> lock(g.mu);
+    const auto it = g.requests.find(seq_id);
+    if (it == g.requests.end()) return;
+    g.last_request = it->second;
+    g.last_request_pending = true;
+    g.requests.erase(it);
+}
+
+static void moe_cache_request_report() {
+    std::lock_guard<std::mutex> lock(g.mu);
+    if (!g.last_request_pending) return;
+    const auto & stats = g.last_request;
+    for (int di = 0; di < g.n_dev; ++di) {
+        size_t cached = 0, total = 0;
+        moe_cache_request_residency(g.dev[di], di, cached, total);
+        if (!total) continue;
+        const long long accesses = stats.hits[di] + stats.misses[di];
+        MOE_CACHE_LOG("[moe-cache] dev=%d request=%lld cached-experts=%zu/%zu expert-cache-hit=%.2f%% (%lld/%lld)\n",
+                di, (long long)stats.id, cached, total,
+                accesses ? 100.0 * stats.hits[di] / accesses : 0.0, stats.hits[di], accesses);
+    }
+    g.last_request_pending = false;
+}
+
 // ---- API: plan --------------------------------------------------------------------
 
 static int moe_cache_plan(int di, const int32_t * ids, int n_ids, int32_t * slot_idx) {
@@ -1236,6 +1468,7 @@ static int moe_cache_plan(int di, const int32_t * ids, int n_ids, int32_t * slot
 
         bool pending = false;
         const int si = moe_cache_find_and_pin(d, p, key, pending);
+        moe_cache_request_record(di, k, n_ids, si >= 0);
         if (si >= 0) {
             slot_idx[k] = si;
             d.hits++;
@@ -1757,11 +1990,153 @@ static unsigned long long moe_cache_glu_hits(const void * src0_data, const void 
     }
 }
 
+// Caller has synchronized all contexts that can use this cache.
+static void moe_cache_release_locked(std::unique_lock<std::mutex> & lock) {
+    g.resizing = true;
+    g.queue.clear();
+    g.cv_idle.wait(lock, [] {
+        for (int w = 0; w < 16; ++w) if (g.inflight_src[w]) return false;
+        return true;
+    });
+    g.redirect.clear();
+    g.glu_learn.clear();
+    memset(g.safe_fuse_blk, 0, sizeof(g.safe_fuse_blk));
+    memset(g.learn_gate_dst, 0, sizeof(g.learn_gate_dst));
+    memset(g.learn_up_dst, 0, sizeof(g.learn_up_dst));
+    g.cur_pool = -1;
+    for (int di = 0; di < g.n_dev; ++di) {
+        auto & d = g.dev[di];
+        ggml_cuda_set_device(di);
+        if (d.compute_stream) CUDA_CHECK(cudaStreamSynchronize(d.compute_stream));
+        const bool had_pools = d.n_pools > 0;
+#if defined(GGML_USE_HIP) && defined(__linux__)
+        size_t total = 0;
+        CUDA_CHECK(cudaMemGetInfo(&d.reclaim_runtime_free, &total));
+        d.reclaim_physical_free = moe_cache_free_memory();
+#endif
+        for (int pi = 0; pi < d.n_pools; ++pi) {
+            auto & p = d.pools[pi];
+            if (p.slab)  CUDA_CHECK(cudaFree(p.slab));
+            if (p.slab2) CUDA_CHECK(cudaFree(p.slab2));
+            p = moe_cache_pool{};
+        }
+        d.n_pools = 0;
+        d.frequency_sample_limit = 0;
+        d.fused.active = false;
+        d.out_rows = 0;
+        d.q8_act_ptr = nullptr;
+        d.q8_act_blk = -1;
+        for (int blk = di; blk < 1024; blk += g.n_dev) {
+            for (int w = 0; w < 4; ++w) {
+                if (had_pools) {
+                    g.hot_pair[blk][w] = g.resident_pair[blk][w];
+                    g.hot_down[blk][w] = g.resident_down[blk][w];
+                }
+                g.resident_pair[blk][w] = 0;
+                g.resident_down[blk][w] = 0;
+            }
+        }
+    }
+    memset(g.blk_pair_pool, -1, sizeof(g.blk_pair_pool));
+    memset(g.blk_down_pool, -1, sizeof(g.blk_down_pool));
+    g.hot_loaded = true;
+    g.backfill.active = false;
+    g.backfill.done = false;
+    g.backfill.phase = 0;
+    g.backfill.blk = 0;
+    g.backfill.eid = 0;
+    g.resizing = false;
+    g.cv.notify_all();
+}
+
+static void moe_cache_release() {
+    if (!g.enabled) return;
+    std::unique_lock<std::mutex> lock(g.mu);
+    moe_cache_release_locked(lock);
+}
+
+static void moe_cache_rebudget(const char * phase) {
+    if (!g.enabled) return;
+    std::unique_lock<std::mutex> lock(g.mu);
+    for (int di = 0; di < g.n_dev; ++di) {
+        if (!g_disc.shapes[di].empty()) {
+            const auto & sh = g_disc.shapes[di][0];
+            moe_cache_hotset_load(sh.n_expert, sh.size);
+            break;
+        }
+    }
+    size_t targets[MOE_CACHE_MAX_DEV] = {};
+    bool resize = false;
+    for (int di = 0; di < g.n_dev; ++di) {
+        const auto & d = g.dev[di];
+        if (d.dead || g_disc.shapes[di].empty()) continue;
+        ggml_cuda_set_device(di);
+        moe_cache_settle_memory(g.dev[di]);
+        const size_t free_mem = moe_cache_free_memory();
+        const size_t current = moe_cache_device_bytes(d);
+        const size_t scratch = moe_cache_scratch_bytes(d);
+        size_t need = 0, rounding = 0;
+        for (const auto & sh : g_disc.shapes[di]) {
+            const bool paired = g.fuse && (sh.roles & 3) == 3;
+            const size_t stride = sh.size * (paired ? 2 : 1);
+            const size_t entries = (paired ? sh.n_tensors / 2 : sh.n_tensors) * (size_t)sh.n_expert;
+            if (entries > (SIZE_MAX - need) / stride) {
+                need = SIZE_MAX;
+                break;
+            }
+            need += entries * stride;
+            rounding += stride * 64;
+        }
+        targets[di] = std::min(need, moe_cache_target_bytes(free_mem, current, scratch));
+        // Keep reserve approximate, but never exceed an explicit byte budget.
+        const size_t tolerance = std::max<size_t>(64u << 20, std::max(current / 50, rounding));
+        const size_t difference = current > targets[di] ? current - targets[di] : targets[di] - current;
+        const bool over_budget = g.budget_mb && current + scratch > (g.budget_mb << 20);
+        const bool missing_pools = d.n_pools < (int)std::min<size_t>(MOE_CACHE_MAX_POOLS, g_disc.shapes[di].size());
+        const bool empty_changed = (current == 0) != (targets[di] == 0);
+        resize |= missing_pools || difference >= tolerance || over_budget || empty_changed;
+    }
+    if (resize) {
+        moe_cache_release_locked(lock);
+        for (int di = 0; di < g.n_dev; ++di) {
+            if (g.dev[di].dead) continue;
+            ggml_cuda_set_device(di);
+            moe_cache_settle_memory(g.dev[di]);
+            targets[di] = std::min(targets[di], moe_cache_target_bytes(moe_cache_free_memory(), 0,
+                    moe_cache_scratch_bytes(g.dev[di])));
+            moe_cache_build_pools(di, targets[di]);
+            auto & d = g.dev[di];
+            for (int blk = di; blk < 1024; blk += g.n_dev) {
+                for (int pi = 0; pi < d.n_pools; ++pi) {
+                    const auto & p = d.pools[pi];
+                    if (!p.slab) continue;
+                    if (p.paired && p.expert_size == g.blk_role_size[0][blk] && p.wtype == g.blk_role_type[0][blk]) {
+                        g.blk_pair_pool[blk] = (int8_t)pi;
+                    }
+                    if (p.expert_size == g.blk_role_size[2][blk] && p.wtype == g.blk_role_type[2][blk]) {
+                        g.blk_down_pool[blk] = (int8_t)pi;
+                    }
+                }
+            }
+        }
+        g.backfill.active = true;
+        g.cv.notify_all();
+    }
+    for (int di = 0; di < g.n_dev; ++di) {
+        const auto & d = g.dev[di];
+        if (d.dead || g_disc.shapes[di].empty()) continue;
+        ggml_cuda_set_device(di);
+        const size_t free_mem = moe_cache_free_memory();
+        MOE_CACHE_LOG("[moe-cache] phase=%s dev=%d cache=%.2f MiB free=%.2f MiB budget=%zu MiB reserve=%zu MiB%s\n",
+                phase, di, moe_cache_device_bytes(d) / 1048576.0, free_mem / 1048576.0,
+                g.budget_mb, g.reserve_mb, resize ? " resized" : "");
+    }
+}
+
 // ---- trim: surrender the device's cache VRAM under allocator pressure ------------------
 //
 // Called from the CUDA backend's pool-alloc OOM retry. Frees every slab and
-// scratch buffer on the device and marks its cache dead (conservative: the
-// budget decision was clearly wrong for this workload). Returns bytes freed.
+// scratch buffer on the device. The next phase can rebuild it with a new budget.
 
 extern "C" size_t ggml_moe_cache_trim(int device) {
     if (!g.enabled || device < 0 || device >= g.n_dev) return 0;
@@ -1769,6 +2144,7 @@ extern "C" size_t ggml_moe_cache_trim(int device) {
     if (d.n_pools == 0 && !d.d_out) return 0;
 
     std::unique_lock<std::mutex> lk(g.mu);
+    g.resizing = true;
     for (auto it = g.queue.begin(); it != g.queue.end(); ) {
         if (it->dev == device) it = g.queue.erase(it); else ++it;
     }
@@ -1799,8 +2175,9 @@ extern "C" size_t ggml_moe_cache_trim(int device) {
     d.fused.active = false;
     memset(g.resident_pair, 0, sizeof(g.resident_pair));
     memset(g.resident_down, 0, sizeof(g.resident_down));
-    d.dead = true;
-    MOE_CACHE_LOG("[moe-cache] dev=%d TRIMMED %zu MB under VRAM pressure — cache off on this device\n",
+    g.resizing = false;
+    g.cv.notify_all();
+    MOE_CACHE_LOG("[moe-cache] dev=%d TRIMMED %zu MB under VRAM pressure; retry at next phase\n",
             device, freed >> 20);
     return freed;
 }
@@ -1841,6 +2218,7 @@ static void moe_cache_invalidate(const void * base, size_t size) {
     };
 
     std::unique_lock<std::mutex> lk(g.mu);
+    g.resizing = true;
     bool reset_frequency = false;
     for (auto it = g.queue.begin(); it != g.queue.end(); ) {
         if (moe_cache_source_overlaps(it->src, it->bytes, base, size) ||
@@ -1905,7 +2283,26 @@ static void moe_cache_invalidate(const void * base, size_t size) {
         }
         memset(g.resident_pair, 0, sizeof(g.resident_pair));
         memset(g.resident_down, 0, sizeof(g.resident_down));
+        bool has_sources = false;
+        for (int blk = 0; blk < 1024; ++blk) {
+            has_sources |= g.role_base[0][blk] || g.role_base[1][blk] || g.blk_down_base[blk];
+        }
+        if (!has_sources) {
+            moe_cache_release_locked(lk);
+            g_disc = moe_cache_discovery{};
+            for (int di = 0; di < g.n_dev; ++di) {
+                g.dev[di].scratch_limit = 0;
+                g.dev[di].scratch_n_in = 0;
+                g.dev[di].scratch_n_out = 0;
+            }
+            memset(g.hot_pair, 0, sizeof(g.hot_pair));
+            memset(g.hot_down, 0, sizeof(g.hot_down));
+            g.hot_loaded = false;
+            g.hotset_path[0] = 0;
+        }
     }
+    g.resizing = false;
+    g.cv.notify_all();
 }
 
 // ---- API: node wall-time samples (bail-out) ---------------------------------------------
@@ -2318,8 +2715,136 @@ static bool moe_cache_selftest_one(int di, ggml_type wtype, int64_t n_in, int64_
     return ok;
 }
 
+static bool moe_cache_request_selftest() {
+    const int64_t n_tokens = g.cur_n_tokens;
+    int32_t counts[] = {1, 1};
+    int32_t seq0[] = {0}, seq1[] = {1};
+    int32_t * seqs[] = {seq0, seq1};
+    moe_cache_request_begin(0, 101);
+    moe_cache_request_begin(1, 202);
+    moe_cache_request_batch(2, counts, seqs);
+    g.cur_n_tokens = 2;
+    moe_cache_request_record(0, 0, 4, true);
+    moe_cache_request_record(0, 1, 4, false);
+    moe_cache_request_record(0, 2, 4, false);
+    moe_cache_request_record(0, 3, 4, false);
+    moe_cache_request_end(0);
+    bool ok = g.last_request.id == 101 && g.last_request.hits[0] == 1 && g.last_request.misses[0] == 1;
+    moe_cache_request_begin(0, 303);
+    ok &= g.requests[0].hits[0] == 0 && g.requests[0].misses[0] == 0;
+    int32_t shared[] = {0, 1};
+    int32_t * shared_seqs[] = {shared};
+    counts[0] = 2;
+    moe_cache_request_batch(1, counts, shared_seqs);
+    g.cur_n_tokens = 1;
+    moe_cache_request_record(0, 0, 1, true);
+    moe_cache_request_end(1);
+    ok &= g.last_request.id == 202 && g.last_request.hits[0] == 1 && g.last_request.misses[0] == 2;
+    moe_cache_request_end(0);
+    ok &= g.last_request.id == 303 && g.last_request.hits[0] == 1 && g.last_request.misses[0] == 0;
+
+    const void * bases[] = {g.role_base[0][0], g.role_base[1][0], g.blk_down_base[0]};
+    const size_t sizes[] = {g.blk_role_size[0][0], g.blk_role_size[1][0], g.blk_role_size[2][0]};
+    const int n_expert = g.blk_n_expert[0];
+    char weights[3][4] = {};
+    g.role_base[0][0] = weights[0];
+    g.role_base[1][0] = weights[1];
+    g.blk_down_base[0] = weights[2];
+    g.blk_n_expert[0] = 2;
+    for (int role = 0; role < 3; ++role) g.blk_role_size[role][0] = 2;
+    moe_cache_device d;
+    d.n_pools = 1;
+    auto & pool = d.pools[0];
+    pool.n_used = 3;
+    pool.slots.resize(3);
+    for (auto & slot : pool.slots) { slot.blk = 0; slot.eid = 0; slot.valid = true; }
+    pool.slots[0].src = weights[1];
+    pool.slots[0].src_gate = weights[0];
+    pool.slots[1].src = weights[2];
+    pool.slots[2].src = weights[1] + 2;
+    pool.slots[2].src_gate = weights[0] + 2;
+    pool.slots[2].eid = 1;
+    pool.slots[2].valid = false;
+    pool.slots[2].queued = true;
+    size_t cached = 0, total = 0;
+    moe_cache_request_residency(d, 0, cached, total);
+    ok &= cached == 1 && total == 2;
+    pool.slots[1].valid = false;
+    moe_cache_request_residency(d, 0, cached, total);
+    ok &= cached == 0 && total == 2;
+    g.role_base[0][0] = bases[0];
+    g.role_base[1][0] = bases[1];
+    g.blk_down_base[0] = bases[2];
+    g.blk_n_expert[0] = n_expert;
+    for (int role = 0; role < 3; ++role) g.blk_role_size[role][0] = sizes[role];
+    g.cur_n_tokens = n_tokens;
+    g.request_seqs.clear();
+    g.last_request = moe_cache_request_stats{};
+    g.last_request_pending = false;
+    MOE_CACHE_LOG("[moe-cache-selftest] per-request statistics %s\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+static bool moe_cache_budget_selftest() {
+    const size_t budget = g.budget_mb;
+    const size_t reserve = g.reserve_mb;
+    constexpr size_t mib = 1u << 20;
+    g.budget_mb = 0;
+    g.reserve_mb = 300;
+    bool ok = moe_cache_target_bytes(800 * mib, 400 * mib, 0) == 900 * mib;
+    ok &= moe_cache_target_bytes(100 * mib, 100 * mib, 0) == 0;
+    g.budget_mb = 600;
+    ok &= moe_cache_target_bytes(800 * mib, 400 * mib, 100 * mib) == 500 * mib;
+    ok &= moe_cache_target_bytes(800 * mib, 400 * mib, 700 * mib) == 0;
+    g.budget_mb = budget;
+    g.reserve_mb = reserve;
+    MOE_CACHE_LOG("[moe-cache-selftest] budget accounting %s\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+static bool moe_cache_resize_selftest() {
+    const size_t budget = g.budget_mb;
+    const size_t reserve = g.reserve_mb;
+    const int n_dev = g.n_dev;
+    const bool prefetch = g.backfill.enabled;
+    const bool hotset = g.hotset_enabled;
+    g.n_dev = 1;
+    g.reserve_mb = 0;
+    g.backfill.enabled = false;
+    g.hotset_enabled = false;
+    g_disc.shapes[0].push_back({1u << 18, GGML_TYPE_MXFP4, 2, 3, 1024});
+    g.budget_mb = 64;
+    moe_cache_rebudget("selftest-initial");
+    const size_t initial = moe_cache_device_bytes(g.dev[0]);
+    g.budget_mb = 128;
+    moe_cache_rebudget("selftest-decode");
+    const size_t decode = moe_cache_device_bytes(g.dev[0]);
+    g.budget_mb = 32;
+    moe_cache_rebudget("selftest-idle");
+    const size_t idle = moe_cache_device_bytes(g.dev[0]);
+    bool ok = initial == (64u << 20) && decode == (128u << 20) && idle == (32u << 20);
+    g.reserve_mb = SIZE_MAX >> 20;
+    moe_cache_rebudget("selftest-pressure");
+    ok &= moe_cache_device_bytes(g.dev[0]) == 0;
+    g.reserve_mb = 0;
+    moe_cache_rebudget("selftest-recover");
+    ok &= moe_cache_device_bytes(g.dev[0]) == (32u << 20) && !g.dev[0].dead;
+    moe_cache_release();
+    g_disc = moe_cache_discovery{};
+    g.budget_mb = budget;
+    g.reserve_mb = reserve;
+    g.n_dev = n_dev;
+    g.backfill.enabled = prefetch;
+    g.hotset_enabled = hotset;
+    g.hot_loaded = false;
+    MOE_CACHE_LOG("[moe-cache-selftest] phase resize and pressure recovery %s\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 static void moe_cache_selftest(void) {
-    bool all = true;
+    bool all = moe_cache_request_selftest();
+    all &= moe_cache_budget_selftest();
+    all &= moe_cache_resize_selftest();
     all &= moe_cache_selftest_one(0, GGML_TYPE_Q4_K, 2048, 768,  8, true);
     all &= moe_cache_selftest_one(0, GGML_TYPE_Q4_K, 768,  2048, 8, false);
     all &= moe_cache_selftest_one(0, GGML_TYPE_Q4_K, 2048, 768,  1, true);
@@ -2329,6 +2854,19 @@ static void moe_cache_selftest(void) {
 }
 
 // ---- registration ----------------------------------------------------------------------
+
+static size_t moe_cache_env_mb(const char * name, size_t fallback) {
+    const char * value = getenv(name);
+    if (!value) return fallback;
+    char * end = nullptr;
+    errno = 0;
+    const unsigned long long mb = strtoull(value, &end, 10);
+    if (errno || *value == '-' || end == value || *end || mb > (SIZE_MAX >> 20)) {
+        MOE_CACHE_LOG("[moe-cache] invalid %s; using %zu MiB\n", name, fallback);
+        return fallback;
+    }
+    return (size_t)mb;
+}
 
 void ggml_moe_cache_register(void) {
     // always-on auto mode: active unless explicitly disabled. Engagement is
@@ -2356,12 +2894,12 @@ void ggml_moe_cache_register(void) {
 
     g.n_dev = dev_count > MOE_CACHE_MAX_DEV ? MOE_CACHE_MAX_DEV : dev_count;
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_NDEV"))      { int n = atoi(e); if (n > 0 && n < g.n_dev) g.n_dev = n; }
-    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_BUDGET_MB")) g.budget_mb = (size_t)atoll(e);
+    g.budget_mb = moe_cache_env_mb("GGML_CUDA_MOE_CACHE_BUDGET_MB", g.budget_mb);
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_INSERTS"))   g.inserts_per_plan = atoi(e);
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_WORKERS"))   { int n = atoi(e); if (n > 0 && n <= 16) g.n_workers = n; }
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_STATS"))     g.stats_every = atoi(e);
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB")) g.min_expert_bytes = (size_t)atoll(e) << 10;
-    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_RESERVE_MB"))    g.reserve_mb = (size_t)atoll(e);
+    g.reserve_mb = moe_cache_env_mb("GGML_CUDA_MOE_CACHE_RESERVE_MB", g.reserve_mb);
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_REUSE"))         g.reuse = atoi(e) > 0;
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_FUSE"))          g.fuse = atoi(e) > 0;
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_MAX_BATCH"))     { int n = atoi(e); if (n >= 1 && n <= 8) g.max_batch = n; }
@@ -2371,6 +2909,13 @@ void ggml_moe_cache_register(void) {
     memset(g.blk_pair_pool, -1, sizeof(g.blk_pair_pool));
     memset(g.blk_down_pool, -1, sizeof(g.blk_down_pool));
 
+    ggml_moe_cache.register_tensor = moe_cache_register_tensor;
+    ggml_moe_cache.rebudget = moe_cache_rebudget;
+    ggml_moe_cache.release = moe_cache_release;
+    ggml_moe_cache.request_begin = moe_cache_request_begin;
+    ggml_moe_cache.request_end = moe_cache_request_end;
+    ggml_moe_cache.request_report = moe_cache_request_report;
+    ggml_moe_cache.request_batch = moe_cache_request_batch;
     ggml_moe_cache.begin    = moe_cache_begin;
     ggml_moe_cache.plan     = moe_cache_plan;
     ggml_moe_cache.dispatch = moe_cache_dispatch;
@@ -2384,7 +2929,7 @@ void ggml_moe_cache_register(void) {
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_REDIRECT")) g.redirect_on = atoi(e) > 0;
 
     MOE_CACHE_LOG("[moe-cache] enabled: n_dev=%d budget=%s inserts/plan=%d workers=%d stats_every=%d layer-quota=%d%%\n",
-            g.n_dev, g.budget_mb ? "env" : "auto-70%-free", g.inserts_per_plan,
+            g.n_dev, g.budget_mb ? "env" : "auto-free-minus-reserve", g.inserts_per_plan,
             g.n_workers, g.stats_every, g.layer_quota_pct);
 
     if (run_selftest) {

@@ -12,6 +12,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "../../src/llama-ext.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -1445,6 +1446,7 @@ private:
             };
 
             slot.callback_on_reset = [this](const server_slot & slot) {
+                llama_moe_cache_request_end(ctx_tgt, slot.id);
                 // flush the generated token stats before reset()
                 if (slot.stats.n_gen > 0) {
                     metrics_on_prediction(slot);
@@ -1972,6 +1974,7 @@ private:
         // reset server kill-switch counter
         n_empty_consecutive = 0;
 
+        llama_moe_cache_request_begin(ctx_tgt, slot.id, slot.task->id);
         SLT_INF(slot, "processing task, is_child = %d\n", slot.task->is_child());
         return true;
     }
@@ -3184,6 +3187,8 @@ private:
                 SRV_TRC("%s", "all slots are idle\n");
 
                 metrics_flush_idle();
+                if (ctx_dft) llama_synchronize(ctx_dft);
+                llama_moe_cache_set_phase(ctx_tgt, false);
 
                 return; // skip further processing
 

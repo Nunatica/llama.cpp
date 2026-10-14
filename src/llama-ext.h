@@ -17,6 +17,15 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         uint32_t n_seqs,
         uint32_t n_outputs);
 
+// Select the MoE cache workspace after synchronizing related target/draft contexts.
+// decode=false restores the prefill workspace and rechecks the cache budget.
+LLAMA_API void llama_moe_cache_set_phase(struct llama_context * ctx, bool decode);
+// Return expert cache VRAM before loading a draft model or context.
+LLAMA_API void llama_moe_cache_release(struct llama_context * ctx);
+// Track request lookups for the report before the idle workspace transition.
+LLAMA_API void llama_moe_cache_request_begin(struct llama_context * ctx, llama_seq_id seq_id, int64_t request_id);
+LLAMA_API void llama_moe_cache_request_end(struct llama_context * ctx, llama_seq_id seq_id);
+
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
 

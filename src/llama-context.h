@@ -55,6 +55,10 @@ struct llama_context {
     //   - changing attention type
     //   - etc.
     void sched_reserve();
+    void moe_cache_set_phase(bool decode);
+    void moe_cache_release();
+    void moe_cache_request_begin(llama_seq_id seq_id, int64_t request_id);
+    void moe_cache_request_end(llama_seq_id seq_id);
 
     void synchronize();
 
@@ -361,6 +365,9 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
+    bool moe_cache_workspace = false;
+    bool moe_cache_decode = false;
+    uint32_t moe_cache_reserve_tokens() const;
 
     // whether the reserve graph has a logits tensor, set in sched_reserve()
     // true until then, because the first output_reserve() runs before any graph is reserved

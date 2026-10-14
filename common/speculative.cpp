@@ -2623,6 +2623,8 @@ common_speculative_init_result::common_speculative_init_result(
     cparams.n_rs_seq  = 0;
     cparams.ctx_other = ctx_tgt;
 
+    if (has_draft || spec_mtp) llama_moe_cache_release(ctx_tgt);
+
     std::string model_path;
     if (has_draft) {
         model_path = params.speculative.draft.mparams.path;
@@ -2656,6 +2658,7 @@ common_speculative_init_result::common_speculative_init_result(
 
         pimpl->context.reset(ctx_dft);
     }
+    llama_moe_cache_set_phase(ctx_tgt, false);
 }
 
 common_speculative_init_result::~common_speculative_init_result() = default;

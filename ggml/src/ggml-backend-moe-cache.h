@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml.h"
+#include "ggml-backend.h"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -20,6 +21,17 @@ extern "C" {
 #endif
 
 struct ggml_moe_cache_api {
+    // Register host expert shapes after model placement and KV allocation.
+    bool (*register_tensor)(const struct ggml_tensor * tensor);
+    // These require all contexts using the cache to be synchronized.
+    void (*rebudget)(const char * phase);
+    void (*release)(void);
+    void (*trim_workspace)(ggml_backend_t backend);
+    void (*request_begin)(int32_t seq_id, int64_t request_id);
+    void (*request_end)(int32_t seq_id);
+    void (*request_report)(void);
+    void (*request_batch)(uint32_t n_tokens, const int32_t * n_seq_id, int32_t * const * seq_id);
+
     // Decide whether the cache engages for this MUL_MAT_ID node.
     // Returns the device id to use (>= 0) or -1 to stay on the pure-CPU path.
     // Performs lazy per-device initialization on first use and selects the

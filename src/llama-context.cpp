@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "../ggml/src/ggml-backend-moe-cache.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -545,6 +546,14 @@ llama_context::llama_context(
         }
     }
 
+    if (ggml_moe_cache.register_tensor && ggml_moe_cache.trim_workspace &&
+        !params.ctx_other && !cparams.training && cparams.causal_attn && !model.hparams.no_alloc) {
+        for (const auto & tensor : model.tensors_by_name) {
+            moe_cache_workspace |= ggml_moe_cache.register_tensor(tensor.second);
+        }
+        if (moe_cache_workspace) ggml_moe_cache.rebudget("initial");
+    }
+
     // Initialize the full vocabulary token ids for backend samplers.
     {
         const int n_vocab = model.vocab.n_tokens();
@@ -695,6 +704,61 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
 }
 
+uint32_t llama_context::moe_cache_reserve_tokens() const {
+    const uint32_t limit = moe_cache_decode ? std::max(32u, cparams.n_seq_max) : cparams.n_ubatch;
+    return std::min({cparams.n_ctx, cparams.n_ubatch, limit});
+}
+
+void llama_context::moe_cache_release() {
+    if (!moe_cache_workspace) return;
+    synchronize();
+    ggml_moe_cache.release();
+}
+
+void llama_context::moe_cache_set_phase(bool decode) {
+    if (!moe_cache_workspace) return;
+    synchronize();
+    if (!decode) ggml_moe_cache.request_report();
+    if (moe_cache_decode != decode || sched_need_reserve) {
+        ggml_moe_cache.release();
+        for (auto & result : gf_res_prev) result.reset();
+        gf_res_prev_active = nullptr;
+        gf_res_reserve.reset();
+        sched.reset();
+        for (auto backend : backend_ptrs) ggml_moe_cache.trim_workspace(backend);
+        moe_cache_decode = decode;
+        sched_need_reserve = true;
+        sched_reserve();
+    }
+    ggml_moe_cache.rebudget(decode ? "decode" : "prefill/idle");
+}
+
+void llama_moe_cache_set_phase(llama_context * ctx, bool decode) {
+    if (ctx) ctx->moe_cache_set_phase(decode);
+}
+
+void llama_moe_cache_release(llama_context * ctx) {
+    if (ctx) ctx->moe_cache_release();
+}
+
+void llama_context::moe_cache_request_begin(llama_seq_id seq_id, int64_t request_id) {
+    if (moe_cache_workspace) ggml_moe_cache.request_begin(seq_id, request_id);
+}
+
+void llama_context::moe_cache_request_end(llama_seq_id seq_id) {
+    if (!moe_cache_workspace) return;
+    synchronize();
+    ggml_moe_cache.request_end(seq_id);
+}
+
+void llama_moe_cache_request_begin(llama_context * ctx, llama_seq_id seq_id, int64_t request_id) {
+    if (ctx) ctx->moe_cache_request_begin(seq_id, request_id);
+}
+
+void llama_moe_cache_request_end(llama_context * ctx, llama_seq_id seq_id) {
+    if (ctx) ctx->moe_cache_request_end(seq_id);
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -709,7 +773,7 @@ void llama_context::sched_reserve() {
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
-    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const uint32_t n_tokens = moe_cache_reserve_tokens();
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
 
@@ -976,7 +1040,7 @@ bool llama_context::memory_update(bool optimize) {
         }
 
         const uint32_t n_seqs = cparams.n_seq_max;
-        const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+        const uint32_t n_tokens = moe_cache_reserve_tokens();
 
         const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
 
@@ -1550,6 +1614,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    if (ggml_moe_cache.request_batch) {
+        ggml_moe_cache.request_batch(ubatch.n_tokens, ubatch.n_seq_id, ubatch.seq_id);
+    }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
@@ -1593,6 +1660,8 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
 
     // micro-batching is not possible for non-causal encoding, so we process the batch in a single shot
     GGML_ASSERT(cparams.n_ubatch >= n_tokens && "encoder requires n_ubatch >= n_tokens");
+
+    if (moe_cache_workspace && (moe_cache_decode || sched_need_reserve)) moe_cache_set_phase(false);
 
     // TODO: this clear of the buffer can easily be forgotten - need something better
     // sync first so any in-flight async copies into embd_seq complete before it is freed
@@ -1879,6 +1948,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     GGML_ASSERT(n_tokens_all <= cparams.n_batch);
 
     GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch >= n_tokens_all) && "non-causal attention requires n_ubatch >= n_tokens");
+
+    if (moe_cache_workspace) {
+        const bool decode_phase = !output_all && n_tokens_all <= std::max(32u, cparams.n_seq_max);
+        if (decode_phase != moe_cache_decode || sched_need_reserve) moe_cache_set_phase(decode_phase);
+    }
 
     // TODO: this clear of the buffer can easily be forgotten - need something better
     // sync first so any in-flight async copies into embd_seq complete before it is freed

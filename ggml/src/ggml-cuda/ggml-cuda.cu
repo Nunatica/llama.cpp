@@ -5,6 +5,7 @@
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/moe-cache.cuh"
+#include "ggml-backend-moe-cache.h"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -5167,6 +5168,21 @@ int ggml_backend_cuda_get_device_count() {
     return ggml_cuda_info().device_count;
 }
 
+static void ggml_backend_cuda_moe_trim_workspace(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) return;
+    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    ggml_cuda_set_device(ctx->device);
+    CUDA_CHECK(cudaDeviceSynchronize());
+#ifdef USE_CUDA_GRAPH
+    ctx->cuda_graphs.clear();
+#endif
+    ctx->concurrent_stream_context.reset();
+    // The caller has retired graph results and scheduler allocations.
+    for (auto & device : ctx->pools) {
+        for (auto & pool : device) pool.reset();
+    }
+}
+
 static std::string ggml_cuda_device_description(int device) {
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, ggml_cuda_get_physical_device(device)));
@@ -6096,6 +6112,9 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
 
             // MoE expert cache (GGML_CUDA_MOE_CACHE=1): wires the CPU mul_mat_id GPU-row path
             ggml_moe_cache_register();
+            if (ggml_moe_cache.rebudget) {
+                ggml_moe_cache.trim_workspace = ggml_backend_cuda_moe_trim_workspace;
+            }
 
             for (int i = 0; i < info.device_count; i++) {
                 const int physical_id = info.devices[i].physical_device;

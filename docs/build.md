@@ -427,6 +427,21 @@ You can download it from your Linux distro's package manager or from here: [ROCm
 The environment variable [`HIP_VISIBLE_DEVICES`](https://rocm.docs.amd.com/en/latest/understand/gpu_isolation.html#hip-visible-devices) can be used to specify which GPU(s) will be used.
 If your GPU is not officially supported you can use the environment variable [`HSA_OVERRIDE_GFX_VERSION`] set to a similar GPU, for example 10.3.0 on RDNA2 (e.g. gfx1030, gfx1031, or gfx1035) or 11.0.0 on RDNA3. Note that [`HSA_OVERRIDE_GFX_VERSION`] is [not supported on Windows](https://github.com/ROCm/ROCm/issues/2654)
 
+### MoE expert cache
+
+The CUDA and HIP backends cache supported CPU expert weights in VRAM when `GGML_CUDA_MOE_CACHE` is enabled (the default). Use `--cpu-moe` to keep expert weights in host memory when testing this path.
+
+- `GGML_CUDA_MOE_CACHE_BUDGET_MB`: maximum cache allocation per device in MiB, including cache scratch buffers. `0` uses available VRAM after the reserve.
+- `GGML_CUDA_MOE_CACHE_RESERVE_MB`: target free VRAM per device in MiB (default: `3072`). The cache leaves approximately this amount free, subject to slot granularity, small memory changes, and allocations by other processes.
+
+After model, context, and KV allocation, the cache measures available VRAM. Loading a draft model or MTP context releases the cache first and recalculates its budget afterward. Small decode batches (up to 32 tokens, or the number of parallel sequences if larger) use a smaller compute workspace; larger batches restore the prefill workspace. Batch limits reported by the context remain unchanged. Cache use during expert computation still follows `GGML_CUDA_MOE_CACHE_MAX_BATCH`.
+
+At each workspace transition, the cache drains background copies, releases its old pools, and rebuilds them within the new budget. Previously resident experts get priority during background refill. The server restores the prefill workspace and budget when all requests finish or are cancelled. Applications using the library directly can call `llama_moe_cache_set_phase(ctx, false)` from `src/llama-ext.h` when generation ends; synchronize related draft contexts first.
+
+Before the server restores the prefill workspace, logs containing `request=` report only the last completed request. `cached-experts` is the number of experts with all required host weight projections resident, divided by the number of cacheable experts on that device. Queued copies do not count as resident. `expert-cache-hit` uses the existing cache lookup hit accounting for that request; prefill work that bypasses cache lookups is excluded. Requests sharing a decode batch have separate hit counters.
+
+Logs beginning with `[moe-cache] phase=` report cache size and free VRAM. On Linux HIP builds, budgeting also checks the driver's physical VRAM counters. An allocation-pressure trim can recover at the next phase transition.
+
 ### Unified Memory
 
 On Linux it is possible to use unified memory architecture (UMA) to share main memory between the CPU and integrated GPU by setting environment variable `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1`. However, this hurts performance for non-integrated GPUs (but enables working with integrated GPUs).

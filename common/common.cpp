@@ -1532,6 +1532,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         res->reset_samplers();
     }
 
+    llama_moe_cache_set_phase(lctx, false);
     return res;
 }
 

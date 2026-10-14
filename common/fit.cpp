@@ -209,7 +209,7 @@ static long common_moe_cache_expert_kib_in_file(const char * path, int64_t n_exp
 static bool common_moe_cache_prefers_cpu_moe(const char * path_model, size_t usable_vram, size_t n_devices) {
     const char * e = getenv("GGML_CUDA_MOE_CACHE");
     if (e && atoi(e) == 0) return false;            // explicitly off
-    long min_kb = 256;
+    long min_kb = 64;
     if (const char * m = getenv("GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB")) min_kb = atol(m);
 
     // expert count from part-1 metadata
