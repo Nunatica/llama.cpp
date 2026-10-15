@@ -18,6 +18,28 @@
 // The macro on the following line shifts it by a factor of 2**3=8, as was needed to fix https://github.com/ggml-org/llama.cpp/issues/18606 .
 #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
 
+template<int ncols1, int nbatch_fa>
+static __device__ __forceinline__ bool flash_attn_mask_tile_is_empty(
+        const half * mask, const int stride_mask, const int j0, const int n_queries,
+        const int k0, const int n_keys) {
+    // This test is uniform across the block and avoids a barrier for dense tiles.
+    if (j0 < n_queries && n_keys > 0 && __half_as_ushort(mask[int64_t(j0)*stride_mask + k0]) != 0xfc00) {
+        return false;
+    }
+
+    const int tid = threadIdx.y*blockDim.x + threadIdx.x;
+    bool live = false;
+    for (int l = tid; l < ncols1*nbatch_fa && !live; l += blockDim.x*blockDim.y) {
+        const int j = j0 + l/nbatch_fa;
+        const int i = l%nbatch_fa;
+        if (j < n_queries && i < n_keys) {
+            // Only exact -inf is masked; finite biases, NaN, and +inf remain live.
+            live = __half_as_ushort(mask[int64_t(j)*stride_mask + k0 + i]) != 0xfc00;
+        }
+    }
+    return !__syncthreads_or(live);
+}
+
 typedef void (* fattn_kernel_t)(
         const char * __restrict__ Q,
         const char * __restrict__ K,

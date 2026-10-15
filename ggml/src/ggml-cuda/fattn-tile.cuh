@@ -576,6 +576,13 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
         const int k_VKQ_0,
         const int k_VKQ_max,
         const int col_Q_0) {
+    if constexpr (ncols1 > 1) {
+        if (mask && ne01.z >= 32 && slope > 0.0f && flash_attn_mask_tile_is_empty<ncols1, nbatch_fa>(
+                mask, stride_mask, col_Q_0, ne01.z, k_VKQ_0, k_VKQ_max - k_VKQ_0)) {
+            return;
+        }
+    }
+
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
     constexpr int cpy_ne = cpy_nb / 4;
 

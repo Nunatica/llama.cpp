@@ -618,6 +618,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr int stride_tile_V = V_is_K_view ? stride_tile_K : (swz ? nbatch_V2 : nbatch_V2 + 4);
 
     const int k_VKQ_0 = kb0 * nbatch_fa;
+    // Multi-stage loading must consume its preloaded tiles. Sparse gather already removes masked rows.
+    if constexpr (ncols1 > 1 && nstages <= 1 && !use_sparse) {
+        if (mask_h && ne01.z >= 32 && slope > 0.0f && flash_attn_mask_tile_is_empty<ncols1, nbatch_fa>(
+                mask_h, stride_mask, jt*ncols1, ne01.z, k_VKQ_0, k_VKQ_sup)) {
+            return;
+        }
+    }
+
 #if defined(TURING_MMA_AVAILABLE)
     T_C_KQ KQ_C[nbatch_fa/(np*(cols_per_warp == 8 ? T_C_KQ::I : T_C_KQ::J))];
 #elif defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)

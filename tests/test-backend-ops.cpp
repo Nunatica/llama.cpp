@@ -8501,6 +8501,38 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+struct test_flash_attn_ext_masked_tiles : public test_flash_attn_ext {
+    using test_flash_attn_ext::test_flash_attn_ext;
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",masked_tiles=1";
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+        ggml_tensor * m = ggml_get_tensor(ctx, "m");
+        std::vector<ggml_fp16_t> data(ggml_nelements(m), ggml_fp32_to_fp16(-INFINITY));
+        for (int64_t s = 0; s < nr23[1]; ++s) {
+            for (int64_t j = 0; j < nb; ++j) {
+                // Empty query tiles and the partial final tile still attend to the sink.
+                if (sinks && (j < 16 || j == nb - 1)) {
+                    continue;
+                }
+                const int64_t end = kv/2 + (j*17 + s*71) % (kv/2);
+                const int64_t begin = end - 63;
+                for (int64_t i = begin; i <= end; ++i) {
+                    data[(s*nb + j)*kv + i] = ggml_fp32_to_fp16(-0.1f*(i % 5));
+                }
+                // Keep one finite entry in an otherwise masked region.
+                if (j % 3 == 0) {
+                    data[(s*nb + j)*kv + 7] = ggml_fp32_to_fp16(-0.5f);
+                }
+            }
+        }
+        ggml_backend_tensor_set(m, data.data(), 0, ggml_nbytes(m));
+    }
+};
+
 // large Q values, so the online softmax has to rescale the partial results
 struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     static constexpr int q_range = 20;
@@ -11813,6 +11845,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {2, 1}, 1024, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {2, 1}, 1024,  4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
+    // Fully masked KV tiles, finite biases, sinks, partial tiles, and multiple sequences.
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t hs : {64, 128, 256, 512}) {
+            test_cases.emplace_back(new test_flash_attn_ext_masked_tiles(hs, hs, 2, {8, 1}, 1024, 33, true, true, 0, 0, GGML_PREC_F32, type, type));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_masked_tiles(128, 128, 2, {8, 2}, 1024, 65, true, true, 0, 0, GGML_PREC_F32, type, type, {0, 2, 1, 3}));
+        test_cases.emplace_back(new test_flash_attn_ext_masked_tiles(128, 128, 1, {8, 1}, 1024, 1025, true, true, 0, 0, GGML_PREC_F32, type, type));
+        test_cases.emplace_back(new test_flash_attn_ext_masked_tiles(128, 128, 2, {1, 1}, 1003, 33, true, false, 8, 10, GGML_PREC_F32, type, type));
+    }
+
     // FLASH_ATTN_EXT: large logits
     test_cases.emplace_back(new test_flash_attn_ext_large_logits( 64,  64, 16, {4, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext_large_logits(128, 128,  8, {4, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
@@ -12267,6 +12309,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // Qwen3-VL-8B https://github.com/ggml-org/llama.cpp/issues/17012
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 16, {1, 1}, 5776, 5776, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    // Compare long masked intervals with mostly dense attention at the same shape.
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t hs : {64, 128}) {
+            test_cases.emplace_back(new test_flash_attn_ext_masked_tiles(hs, hs, 8, {8, 1}, 8192, 512, true, true, 0, 0, GGML_PREC_F32, type, type));
+            test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 8, {8, 1}, 8192, 512, true, true, 0, 0, GGML_PREC_F32, type, type));
+        }
+    }
 
     // Sparse flash attention (n_kv_max hint) decode across KV depths.
     // Shapes: 576/512 DeepSeek MLA, 512/512 DeepSeek-V4/GLM-5.2, 256/256 gqa12 Qwen QSA.
